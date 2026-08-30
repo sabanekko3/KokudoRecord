@@ -1101,7 +1101,7 @@ def match_named_nodes(nodes, query, graph=None, dist=None):
 
     if "," in hint or "/" in hint:  # 緯度,経度（CSVを壊さないよう / でもよい）
         try:
-            lat, lon = (float(x) for x in re.split(r"[,/]", hint, 1))
+            lat, lon = (float(x) for x in re.split(r"[,/]", hint, maxsplit=1))
         except ValueError:
             return hits
         return [min(hits, key=lambda n: (n["lat"] - lat) ** 2 + (n["lon"] - lon) ** 2)]
