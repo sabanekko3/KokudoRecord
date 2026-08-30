@@ -27,16 +27,20 @@ from __future__ import annotations
 import argparse
 import csv
 import heapq
+import http.server
+import io
 import json
 import math
 import os
 import random
 import re
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.request
+import webbrowser
 from collections import defaultdict
 
 # --------------------------------------------------------------------------
@@ -48,6 +52,7 @@ CACHE_DIR = os.path.join(BASE_DIR, "cache")
 AREA_DIR = os.path.join(CACHE_DIR, "area")
 NODE_DIR = os.path.join(CACHE_DIR, "nodes")
 LIST_DIR = os.path.join(BASE_DIR, "交差点一覧")
+JUNCTION_PATH = os.path.join(CACHE_DIR, "junctions.json")
 EKI_DIR = os.path.join(CACHE_DIR, "michinoeki")
 CSV_PATH = os.path.join(BASE_DIR, "routes.csv")
 EKI_CSV_PATH = os.path.join(BASE_DIR, "michinoeki.csv")
@@ -95,7 +100,7 @@ SHOW_TODO = True
 # 線の色。未走破は白地図の市町村界（灰色の細線）と紛れないよう青にしている。
 # 選択中の縁取りは、走破済み（赤）とも未走破（青）とも喧嘩しない琥珀色。
 # 道の駅を最初から表示するか
-SHOW_EKI = True
+SHOW_EKI = False
 DONE_COLOR = "#d81f26"
 TODO_COLOR = "#2f7fc7"
 SELECT_COLOR = "#ffa000"
@@ -110,6 +115,9 @@ COORD_PRECISION = 7
 # グラフ上の隙間をどこまで繋ぐか [m]。OSM で隣り合う way の端点が数mずれたまま
 # 接続されておらず、路線が分断されて見えることがある（国道158号 飛騨清見IC付近など）。
 GAP_BRIDGE_M = 50.0
+# 行き止まり「同士」が向かい合っているだけなら、もっと広い隙間も繋いでよい。
+# 片方が道の途中だと立体交差を掴む危険があるが、両方が行き止まりならまず隙間。
+GAP_BRIDGE_END_M = 300.0
 
 PREFECTURES = [
     "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
@@ -120,6 +128,17 @@ PREFECTURES = [
     "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
     "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 ]
+
+# 地点の種類（地図の描き分けと、区間欄に書ける名前の由来）
+KIND_PLAIN = 0      # OSM の名前付きノード（信号なし）
+KIND_SIGNAL = 1     # OSM の信号交差点
+KIND_CROSS = 2      # 国道どうしの交点（こちらで算出）
+KIND_END = 3        # 路線の端（こちらで算出）
+# 同じ交差点が数m刻みで何点も立つので、この距離以内の同名はまとめる [km]
+CROSS_MERGE_KM = 0.15
+# 同じ地点に複数の呼び名が付くときの区切り。区間欄にはどちらの名前でも書ける
+# （`match_named_nodes` の部分一致で拾える）ので、この文字は名前に使わないこと。
+NAME_SEP = "／"
 
 FULL = "全線"
 # 交差点区間の区切り文字
@@ -721,6 +740,121 @@ def build_eki():
 
 
 # --------------------------------------------------------------------------
+# 区間指定に使える地点を増やす
+# --------------------------------------------------------------------------
+#
+# OSM に名前の付いた交差点は偏っていて、37路線は4個以下しかない。
+# 名前に頼らず区間を切れるよう、手持ちの形状から次の2種類を算出して足す。
+#   - 国道どうしの交点（全国 4,340 箇所）
+#   - 路線の端（1路線に2つ）
+# さらに区間欄には `@緯度,経度` と直接書ける（`nearest()` で吸着させる）。
+
+
+def _pack(key):
+    """node_key を1つの整数にする。交点の集計で辞書を軽くするため。"""
+    return int(round(key[0] * 1e7)) * (1 << 32) + int(round(key[1] * 1e7))
+
+
+def cache_signature(refs):
+    """路線キャッシュが変わったかを見る印"""
+    sig = []
+    for ref in refs:
+        path = route_cache_path(ref)
+        if os.path.exists(path):
+            sig.append(f"{ref}:{os.path.getsize(path)}")
+    return "|".join(sig)
+
+
+def build_junction_index(refs, quiet=False):
+    """国道どうしの交点を求める。{packされた座標: (路線番号, ...)}
+
+    2本以上が通るノードのうち、隣のノードと路線の組み合わせが変わる境目だけを
+    採る。こうしないと重複区間の途中が丸ごと交点になってしまう。
+    """
+    cached = load_json(JUNCTION_PATH)
+    sig = cache_signature(refs)
+    if cached and cached.get("signature") == sig:
+        return {int(k): tuple(v) for k, v in cached["junctions"].items()}
+
+    if not quiet:
+        print("  国道どうしの交点を算出しています…（初回のみ）", file=sys.stderr)
+
+    seen = defaultdict(int)
+    for ref in refs:
+        ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
+        nodes = {_pack(node_key(c)) for coords in ways.values() for c in coords}
+        for n in nodes:
+            seen[n] += 1
+    shared = {n for n, c in seen.items() if c >= 2}
+    del seen
+
+    node_refs = defaultdict(list)
+    adj = defaultdict(set)
+    for ref in refs:
+        ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
+        for coords in ways.values():
+            prev = None
+            for c in coords:
+                n = _pack(node_key(c))
+                if n in shared:
+                    node_refs[n].append(ref)
+                if prev is not None and (prev in shared or n in shared):
+                    adj[prev].add(n)
+                    adj[n].add(prev)
+                prev = n
+
+    combos = {n: tuple(sorted(set(rs), key=int)) for n, rs in node_refs.items()}
+    junctions = {n: rs for n, rs in combos.items()
+                 if len(rs) >= 2 and any(combos.get(q, ()) != rs for q in adj.get(n, ()))}
+
+    save_json(JUNCTION_PATH, {"signature": sig,
+                              "junctions": {str(k): list(v) for k, v in junctions.items()}})
+    if not quiet:
+        print(f"  国道どうしの交点 {len(junctions):,} 箇所", file=sys.stderr)
+    return junctions
+
+
+def derived_nodes(ref, graph, node_dist, junctions):
+    """その路線で使える、こちらで算出した地点"""
+    out = []
+
+    # 交差点の分岐は数m刻みで何点も立つことがあるので、同名で近いものはまとめる
+    found = []
+    for key in sorted(graph.adj):
+        rs = junctions.get(_pack(key))
+        if not rs or ref not in rs:
+            continue
+        name = "×".join(f"R{r}" for r in rs)
+        if any(n == name and haversine_km(key[1], key[0], la, lo) < CROSS_MERGE_KM
+               for n, la, lo in found):
+            continue
+        found.append((name, key[1], key[0]))
+        out.append({"name": name, "lat": key[1], "lon": key[0], "kind": KIND_CROSS})
+
+    ends = route_ends(graph, node_dist)
+    for key, label in ends:
+        out.append({"name": f"R{ref}端({label})", "lat": key[1], "lon": key[0],
+                    "kind": KIND_END})
+    return out
+
+
+def route_ends(graph, node_dist):
+    """路線の両端。向き（北/南/東/西）を付けて区別できるようにする。"""
+    if not node_dist:
+        return []
+    start = min(node_dist, key=lambda k: node_dist[k])
+    far = max(node_dist, key=lambda k: node_dist[k])
+    if start == far:
+        return []
+    dlat, dlon = far[1] - start[1], far[0] - start[0]
+    if abs(dlat) >= abs(dlon):
+        a, b = ("南", "北") if dlat > 0 else ("北", "南")
+    else:
+        a, b = ("西", "東") if dlon > 0 else ("東", "西")
+    return [(start, a), (far, b)]
+
+
+# --------------------------------------------------------------------------
 # 経路グラフ
 # --------------------------------------------------------------------------
 
@@ -744,20 +878,17 @@ class RouteGraph:
         self.bridged = self._bridge_gaps()
 
     def _bridge_gaps(self):
-        """way が繋がっていないだけの小さな隙間を埋める。
+        """way が繋がっていないだけの隙間を埋める。2段階でやる。
 
-        行き止まり（次数1）の点から GAP_BRIDGE_M 以内に別のかたまりの点があれば繋ぐ。
-        上下線分離区間で反対車線を掴む可能性はあるが、走破判定は辺の集合なので
-        実害は小さい。繋いだ本数を返す。
+        1. 行き止まり（次数1）から `GAP_BRIDGE_M` 以内の任意のノードへ。
+           T字路の取りこぼしを拾うが、立体交差を掴まないよう距離は短く抑える。
+        2. 行き止まり「同士」なら `GAP_BRIDGE_END_M` まで。向かい合った端点は
+           まず未接続の隙間なので、広めに見てよい。
+
+        繋いだ本数を返す。
         """
         if not self.adj:
             return 0
-        limit = GAP_BRIDGE_M / 1000.0
-        cell = limit / 111.0 * 2          # 升目は探索距離の倍ほど
-
-        grid = defaultdict(list)
-        for k in self.adj:
-            grid[(int(k[1] / cell), int(k[0] / cell))].append(k)
 
         parent = {k: k for k in self.adj}
 
@@ -772,9 +903,23 @@ class RouteGraph:
             if ra != rb:
                 parent[ra] = rb
 
-        ends = sorted(k for k, v in self.adj.items() if len(v) == 1)
+        def link(a, b, d):
+            key = edge_key(a, b)
+            self.edges[key] = d
+            self.adj[a].append((b, d, key))
+            self.adj[b].append((a, d, key))
+            parent[find(a)] = find(b)
+
         made = 0
-        for e in ends:
+
+        # -- 1段目: 行き止まり → 任意のノード -----------------------------
+        limit = GAP_BRIDGE_M / 1000.0
+        cell = limit / 111.0 * 2
+        grid = defaultdict(list)
+        for k in self.adj:
+            grid[(int(k[1] / cell), int(k[0] / cell))].append(k)
+
+        for e in sorted(k for k, v in self.adj.items() if len(v) == 1):
             gy, gx = int(e[1] / cell), int(e[0] / cell)
             best, best_d = None, limit
             for dy in (-1, 0, 1):
@@ -785,14 +930,27 @@ class RouteGraph:
                         d = haversine_km(e[1], e[0], k[1], k[0])
                         if d < best_d:
                             best, best_d = k, d
-            if best is None:
-                continue
-            key = edge_key(e, best)
-            self.edges[key] = best_d
-            self.adj[e].append((best, best_d, key))
-            self.adj[best].append((e, best_d, key))
-            parent[find(e)] = find(best)
-            made += 1
+            if best is not None:
+                link(e, best, best_d)
+                made += 1
+
+        # -- 2段目: 行き止まり同士 ----------------------------------------
+        ends = sorted(k for k, v in self.adj.items() if len(v) == 1)
+        if 1 < len(ends) <= 3000:
+            limit2 = GAP_BRIDGE_END_M / 1000.0
+            pairs = []
+            for i, a in enumerate(ends):
+                for b in ends[i + 1:]:
+                    if find(a) == find(b):
+                        continue
+                    d = haversine_km(a[1], a[0], b[1], b[0])
+                    if d <= limit2:
+                        pairs.append((d, a, b))
+            for d, a, b in sorted(pairs):
+                if find(a) != find(b):
+                    link(a, b, d)
+                    made += 1
+
         return made
 
     def total_km(self):
@@ -901,6 +1059,20 @@ def norm_name(text):
     return unicodedata.normalize("NFKC", text).replace(" ", "").replace("　", "")
 
 
+# 「@37.4056,138.8087」のように、名前ではなく座標で区間端を指定する書き方
+COORD_ONLY_RE = re.compile(
+    r"^@?\s*(\d+(?:\.\d+)?)\s*[,/]\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def endpoint_candidates(nodes, text, graph, dist):
+    """区間端の候補。座標で書かれていれば最寄りのノードに吸着させる。"""
+    m = COORD_ONLY_RE.match(text.strip())
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        return [{"name": text.strip(), "lat": lat, "lon": lon, "kind": KIND_PLAIN}]
+    return match_named_nodes(nodes, text, graph, dist)
+
+
 def match_named_nodes(nodes, query, graph=None, dist=None):
     """交差点名の候補を返す。
 
@@ -927,9 +1099,9 @@ def match_named_nodes(nodes, query, graph=None, dist=None):
     if not hits or not hint:
         return hits
 
-    if "," in hint:  # 緯度,経度
+    if "," in hint or "/" in hint:  # 緯度,経度（CSVを壊さないよう / でもよい）
         try:
-            lat, lon = (float(x) for x in hint.split(",", 1))
+            lat, lon = (float(x) for x in re.split(r"[,/]", hint, 1))
         except ValueError:
             return hits
         return [min(hits, key=lambda n: (n["lat"] - lat) ** 2 + (n["lon"] - lon) ** 2)]
@@ -946,13 +1118,14 @@ def match_named_nodes(nodes, query, graph=None, dist=None):
 
 def resolve_node_section(graph, nodes, sec, ref, dist=None):
     """「A〜B」を辺の集合に変換する"""
-    cand_a = match_named_nodes(nodes, sec["a"], graph, dist)
-    cand_b = match_named_nodes(nodes, sec["b"], graph, dist)
+    cand_a = endpoint_candidates(nodes, sec["a"], graph, dist)
+    cand_b = endpoint_candidates(nodes, sec["b"], graph, dist)
 
     for label, name, cands in (("A", sec["a"], cand_a), ("B", sec["b"], cand_b)):
         if not cands:
-            print(f"  国道{ref}号: 交差点「{name}」が見つかりません。"
-                  f"`python kokudo_map.py nodes {ref}` で使える名前を確認してください。", file=sys.stderr)
+            print(f"  国道{ref}号: 地点「{name}」が見つかりません。"
+                  f"地図で名前を確かめるか、`@緯度,経度` の形で場所を直接書いてください。",
+                  file=sys.stderr)
             return None, None
 
     # 候補が複数あるときは，経路がいちばん短くなる組み合わせを採る
@@ -1125,22 +1298,25 @@ def cmd_nodes(args):
     if not ways:
         print(f"国道{ref}号の形状がありません。", file=sys.stderr)
         return
-    if not nodes:
-        print(f"国道{ref}号には名前付きの交差点がOSMに登録されていません。"
-              f"市町村単位での指定を使ってください。")
-        return
+
 
     graph = RouteGraph(ways)
     start = graph.far_end()
     dist, _ = graph.dijkstra(start, [])
 
+    cached_refs = sorted((n[1:-5] for n in os.listdir(CACHE_DIR)
+                          if n.startswith("r") and n.endswith(".json")), key=int)
+    nodes = nodes + derived_nodes(ref, graph, dist, build_junction_index(cached_refs))
+
+    labels = {KIND_SIGNAL: "信号", KIND_CROSS: "国道交点", KIND_END: "路線の端"}
     rows = []
     for n in nodes:
         k = graph.nearest(n["lon"], n["lat"])
+        kind = n.get("kind", KIND_SIGNAL if n.get("signals") else KIND_PLAIN)
         rows.append({
             "名称": n["name"],
             "起点からの距離km": round(dist.get(k, float("nan")), 1) if k in dist else "",
-            "信号交差点": "○" if n["signals"] else "",
+            "信号交差点": labels.get(kind, ""),
             "緯度": round(n["lat"], 6),
             "経度": round(n["lon"], 6),
         })
@@ -1168,7 +1344,7 @@ def cmd_nodes(args):
 # build
 # --------------------------------------------------------------------------
 
-def add_named_nodes(acc, ref, node_dist):
+def add_named_nodes(acc, ref, node_dist, nodes):
     """1路線ぶんの交差点名を acc に足しこむ。
 
     重複区間では同じ交差点が複数の路線に現れるので、座標と名前でまとめ、
@@ -1176,24 +1352,127 @@ def add_named_nodes(acc, ref, node_dist):
     node_dist は far_end() を起点としたキロ程（`@` 指定の解決と同じ値）。
     グラフ上に見つからない交差点は距離を None にする。
     """
-    for n in (load_json(node_cache_path(ref)) or {}).get("nodes") or []:
+    for n in nodes:
         k = node_key([n["lon"], n["lat"]])
         key = (k, n["name"])
         entry = acc.get(key)
         if entry is None:
+            kind = n.get("kind")
+            if kind is None:
+                kind = KIND_SIGNAL if n.get("signals") else KIND_PLAIN
             entry = acc[key] = [round(n["lat"], 5), round(n["lon"], 5),
-                                n["name"], 1 if n["signals"] else 0, []]
+                                n["name"], kind, []]
         km = (node_dist or {}).get(k)
         entry[4].append([ref, round(km, 1) if km is not None else None])
 
 
 def finalize_named_nodes(acc):
-    """[緯度, 経度, 名前, 信号か, [[路線番号, 起点からのkm], ...]] の並びにする"""
+    """[緯度, 経度, 名前, 種類, [[路線番号, 起点からのkm], ...]] の並びにする。
+
+    同じ座標に複数の呼び名が付くことがある（国道の終端が別の国道の途中と
+    交わっている場合、そこは「R363×R419」であり「R419端(北)」でもある）。
+    別々の点のままだと重なり判定で片方が消え、消えなかった方が持っていない
+    路線の区間を指定できなくなる。1点にまとめて両方の名前と路線を持たせる。
+    """
+    merged = {}
+    for (key, name), entry in acc.items():
+        base = merged.get(key)
+        if base is None:
+            merged[key] = entry
+            continue
+        if name not in base[2].split(NAME_SEP):
+            base[2] += NAME_SEP + name
+        base[3] = max(base[3], entry[3])
+        for pair in entry[4]:
+            if pair not in base[4]:
+                base[4].append(pair)
+
     out = []
-    for entry in acc.values():
+    for entry in merged.values():
         entry[4].sort(key=lambda pair: int(pair[0]))
         out.append(entry)
     return out
+
+
+def route_covered(ref, graph, recs, node_dist, nodes):
+    """1路線ぶんの走破した辺と、表示用の区間ラベル・走破日・メモを求める。
+
+    build と serve の両方から呼ぶ（serve は編集された1路線だけ呼び直す）。
+    """
+    covered = set()
+    sections, dates, notes = [], [], []
+
+    for rec in recs:
+        if rec["date"]:
+            dates.append(rec["date"])
+        if rec["note"]:
+            notes.append(rec["note"])
+
+        if rec["kind"] == "full":
+            covered |= set(graph.edges)
+            sections.append(FULL)
+
+        elif rec["kind"] == "area":
+            adata = load_json(area_cache_path(ref, rec["area"]))
+            if adata is None:
+                print(f"  国道{ref}号（{rec['area']}）が未取得です。"
+                      f"`python kokudo_map.py fetch` を実行してください。", file=sys.stderr)
+                continue
+            sub_graph = RouteGraph(adata.get("ways") or {})
+            hit = set(sub_graph.edges) & set(graph.edges)
+            if not hit:
+                print(f"  国道{ref}号（{rec['area']}）に該当する区間がありません。", file=sys.stderr)
+                continue
+            covered |= hit
+            sections.append(rec["label"])
+
+        elif rec["kind"] == "nodes":
+            edges, dist = resolve_node_section(graph, nodes, rec, ref, node_dist)
+            if edges:
+                covered |= edges
+                sections.append(f"{rec['label']}（{dist:.0f} km）")
+
+    return covered, sections, dates, notes
+
+
+def route_points(ref, graph, node_dist, junctions):
+    """その路線で区間指定に使える地点。OSM の名前＋こちらで算出したもの。"""
+    osm = (load_json(node_cache_path(ref)) or {}).get("nodes") or []
+    return osm + derived_nodes(ref, graph, node_dist, junctions)
+
+
+def route_features(ref, ways, covered):
+    """各wayを走破／未走破の連続部分に切り分けて GeoJSON Feature にする"""
+    done_lines, todo_lines = [], []
+    for coords in ways.values():
+        run, run_state = [], None
+        for i in range(len(coords) - 1):
+            a, b = node_key(coords[i]), node_key(coords[i + 1])
+            state = edge_key(a, b) in covered
+            if state != run_state:
+                if len(run) >= 2:
+                    (done_lines if run_state else todo_lines).append(run)
+                run, run_state = [coords[i]], state
+            run.append(coords[i + 1])
+        if len(run) >= 2:
+            (done_lines if run_state else todo_lines).append(run)
+
+    out = []
+    for lines, kind in ((todo_lines, "todo"), (done_lines, "done")):
+        simplified = [s for s in (simplify(l, SIMPLIFY_TOLERANCE) for l in lines) if len(s) >= 2]
+        if simplified:
+            out.append({
+                "type": "Feature",
+                "properties": {"ref": ref, "kind": kind},
+                "geometry": {"type": "MultiLineString", "coordinates": simplified},
+            })
+    return out
+
+
+def route_status(route_km, route_done_km, covered):
+    if not covered:
+        return "todo"
+    return "done" if route_done_km >= route_km * 0.98 else "partial"
 
 
 def build_data():
@@ -1212,9 +1491,11 @@ def build_data():
     all_refs = sorted(cached_refs | set(by_ref), key=int)
 
     features, summary = [], []
-    total_km = done_km = 0.0
+    total_km = 0.0
     counted_edges = set()
     node_acc = {}
+    covered_by_ref, edge_km = {}, {}
+    junctions = build_junction_index(all_refs)
 
     for ref in all_refs:
         data = load_json(route_cache_path(ref))
@@ -1227,90 +1508,26 @@ def build_data():
         graph = RouteGraph(ways)
         start = graph.far_end()
         node_dist = graph.dijkstra(start, [])[0] if start else None
-        add_named_nodes(node_acc, ref, node_dist)
+        nodes_here = route_points(ref, graph, node_dist, junctions)
+        add_named_nodes(node_acc, ref, node_dist, nodes_here)
 
-        covered = set()
-        sections, dates, notes = [], [], []
-
-        for rec in recs:
-            if rec["date"]:
-                dates.append(rec["date"])
-            if rec["note"]:
-                notes.append(rec["note"])
-
-            if rec["kind"] == "full":
-                covered |= set(graph.edges)
-                sections.append(FULL)
-
-            elif rec["kind"] == "area":
-                adata = load_json(area_cache_path(ref, rec["area"]))
-                if adata is None:
-                    print(f"  国道{ref}号（{rec['area']}）が未取得です。"
-                          f"`python kokudo_map.py fetch` を実行してください。", file=sys.stderr)
-                    continue
-                sub = RouteGraph(adata.get("ways") or {})
-                hit = set(sub.edges) & set(graph.edges)
-                if not hit:
-                    print(f"  国道{ref}号（{rec['area']}）に該当する区間がありません。", file=sys.stderr)
-                    continue
-                covered |= hit
-                sections.append(rec["label"])
-
-            elif rec["kind"] == "nodes":
-                ndata = load_json(node_cache_path(ref))
-                if ndata is None:
-                    print(f"  国道{ref}号の交差点名が未取得です。"
-                          f"`python kokudo_map.py fetch` を実行してください。", file=sys.stderr)
-                    continue
-                edges, dist = resolve_node_section(graph, ndata.get("nodes") or [], rec, ref, node_dist)
-                if edges:
-                    covered |= edges
-                    sections.append(f"{rec['label']}（{dist:.0f} km）")
+        covered, sections, dates, notes = route_covered(ref, graph, recs, node_dist, nodes_here)
 
         # 延長の集計
         route_km = route_done_km = 0.0
-        edge_lengths = graph.edges
-        for key, km in edge_lengths.items():
+        for key, km in graph.edges.items():
             route_km += km
             hit = key in covered
             if hit:
                 route_done_km += km
+                edge_km[key] = km
             if key not in counted_edges:
                 counted_edges.add(key)
                 total_km += km
-                if hit:
-                    done_km += km
 
-        if not covered:
-            status = "todo"
-        elif route_done_km >= route_km * 0.98:
-            status = "done"
-        else:
-            status = "partial"
-
-        # 描画: 各wayを走破／未走破の連続部分に切り分ける
-        done_lines, todo_lines = [], []
-        for coords in ways.values():
-            run, run_state = [], None
-            for i in range(len(coords) - 1):
-                a, b = node_key(coords[i]), node_key(coords[i + 1])
-                state = edge_key(a, b) in covered
-                if state != run_state:
-                    if len(run) >= 2:
-                        (done_lines if run_state else todo_lines).append(run)
-                    run, run_state = [coords[i]], state
-                run.append(coords[i + 1])
-            if len(run) >= 2:
-                (done_lines if run_state else todo_lines).append(run)
-
-        for lines, kind in ((todo_lines, "todo"), (done_lines, "done")):
-            simplified = [s for s in (simplify(l, SIMPLIFY_TOLERANCE) for l in lines) if len(s) >= 2]
-            if simplified:
-                features.append({
-                    "type": "Feature",
-                    "properties": {"ref": ref, "kind": kind},
-                    "geometry": {"type": "MultiLineString", "coordinates": simplified},
-                })
+        status = route_status(route_km, route_done_km, covered)
+        covered_by_ref[ref] = covered
+        features.extend(route_features(ref, ways, covered))
 
         lats = [p[1] for c in ways.values() for p in c]
         lons = [p[0] for c in ways.values() for p in c]
@@ -1329,6 +1546,12 @@ def build_data():
     nodes = finalize_named_nodes(node_acc)
     eki, eki_added = build_eki()
 
+    # 重複区間を二重に数えないよう、走破した辺の集合の和で距離を出す
+    done_edges = set()
+    for edges in covered_by_ref.values():
+        done_edges |= edges
+    done_km = sum(edge_km.get(e, 0.0) for e in done_edges)
+
     stats = {
         "totalRoutes": len(summary),
         "doneRoutes": sum(1 for s in summary if s["status"] == "done"),
@@ -1340,32 +1563,53 @@ def build_data():
         "ekiDone": sum(1 for e in eki if e[4]),
         "ekiAdded": eki_added,
     }
-    return {"type": "FeatureCollection", "features": features}, summary, stats, nodes, eki
+    return {
+        "geojson": {"type": "FeatureCollection", "features": features},
+        "summary": summary,
+        "stats": stats,
+        "nodes": nodes,
+        "eki": eki,
+        # serve が1路線だけ計算し直すのに使う
+        "coveredByRef": covered_by_ref,
+        "edgeKm": edge_km,
+        "junctions": junctions,
+    }
+
+
+def render_html(data, editable=False):
+    """地図の HTML を組み立てる。editable=True なら serve 用の編集UIが出る。"""
+    config = {"basemap": DEFAULT_BASEMAP, "opacity": BASEMAP_OPACITY,
+              "showTodo": bool(SHOW_TODO), "showNodes": bool(SHOW_NODES),
+              "nodeZoom": NODE_MIN_ZOOM, "labelZoom": LABEL_MIN_ZOOM,
+              "showEki": bool(SHOW_EKI), "editable": bool(editable),
+              "colors": {"done": DONE_COLOR, "todo": TODO_COLOR, "select": SELECT_COLOR}}
+    return (HTML_TEMPLATE
+            .replace("__GEOJSON__", json.dumps(data["geojson"], separators=(",", ":")))
+            .replace("__SUMMARY__", json.dumps(data["summary"], ensure_ascii=False,
+                                               separators=(",", ":")))
+            .replace("__STATS__", json.dumps(data["stats"], ensure_ascii=False))
+            .replace("__NODES__", json.dumps(data["nodes"], ensure_ascii=False,
+                                             separators=(",", ":")))
+            .replace("__EKI__", json.dumps(data["eki"], ensure_ascii=False,
+                                           separators=(",", ":")))
+            .replace("__CONFIG__", json.dumps(config))
+            .replace("__DONE_COLOR__", DONE_COLOR)
+            .replace("__TODO_COLOR__", TODO_COLOR)
+            .replace("__SELECT_COLOR__", SELECT_COLOR)
+            .replace("__NAME_SEP__", NAME_SEP))
 
 
 def cmd_build(args):
     print("地図を組み立てています…")
-    geojson, summary, stats, nodes, eki = build_data()
+    data = build_data()
+    geojson, summary = data["geojson"], data["summary"]
+    stats, nodes, eki = data["stats"], data["nodes"], data["eki"]
     if not summary:
         print("描ける路線がありません。先に `python kokudo_map.py fetch` を実行してください。",
               file=sys.stderr)
         sys.exit(1)
 
-    config = {"basemap": DEFAULT_BASEMAP, "opacity": BASEMAP_OPACITY,
-              "showTodo": bool(SHOW_TODO), "showNodes": bool(SHOW_NODES),
-              "nodeZoom": NODE_MIN_ZOOM, "labelZoom": LABEL_MIN_ZOOM,
-              "showEki": bool(SHOW_EKI),
-              "colors": {"done": DONE_COLOR, "todo": TODO_COLOR, "select": SELECT_COLOR}}
-    html = (HTML_TEMPLATE
-            .replace("__GEOJSON__", json.dumps(geojson, separators=(",", ":")))
-            .replace("__SUMMARY__", json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
-            .replace("__STATS__", json.dumps(stats, ensure_ascii=False))
-            .replace("__NODES__", json.dumps(nodes, ensure_ascii=False, separators=(",", ":")))
-            .replace("__EKI__", json.dumps(eki, ensure_ascii=False, separators=(",", ":")))
-            .replace("__CONFIG__", json.dumps(config))
-            .replace("__DONE_COLOR__", DONE_COLOR)
-            .replace("__TODO_COLOR__", TODO_COLOR)
-            .replace("__SELECT_COLOR__", SELECT_COLOR))
+    html = render_html(data, editable=False)
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -1384,6 +1628,229 @@ def cmd_build(args):
     if stats["totalRoutes"] < 300:
         print("\n※ 走破率は取得済みの路線だけで計算しています。")
         print("  全国基準にするには `python kokudo_map.py fetch --all` を一度実行してください。")
+
+
+# --------------------------------------------------------------------------
+# serve（地図から履歴を編集する）
+# --------------------------------------------------------------------------
+#
+# file:// で開いた HTML からはファイルを書けないので、127.0.0.1 だけで待ち受ける
+# 小さなサーバを立てて、ブラウザからの保存要求を Python 側で CSV に書く。
+# 全路線の再計算は40秒ほどかかるので、編集された1路線だけ計算し直して差分を返す。
+
+SERVE_PORT = 8765
+
+
+def append_route_row(ref, section, date, note):
+    """routes.csv の末尾に1行足す。既存の行には触れない。"""
+    text = ""
+    if os.path.exists(CSV_PATH):
+        with open(CSV_PATH, encoding="utf-8-sig") as f:
+            text = f.read()
+    if not text.strip():
+        text = ",".join(["路線番号", "区間", "走破日", "メモ"]) + "\n"
+    if not text.endswith("\n"):
+        text += "\n"
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow([ref, section, date, note])
+    with open(CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(text + buf.getvalue())
+
+
+def set_eki_visit(pref, name, date, note):
+    """michinoeki.csv の1駅ぶんを書き換える。無ければ足す。"""
+    rows, found = [], False
+    if os.path.exists(EKI_CSV_PATH):
+        with open(EKI_CSV_PATH, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                if ((row.get("都道府県") or "").strip() == pref
+                        and eki_name(row.get("道の駅") or "") == name):
+                    row["訪問日"] = date
+                    if note is not None:
+                        row["メモ"] = note
+                    found = True
+                rows.append({k: (row.get(k) or "") for k in EKI_HEADER})
+    if not found:
+        rows.append({"都道府県": pref, "道の駅": name, "訪問日": date, "メモ": note or ""})
+    with open(EKI_CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=EKI_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def recompute_ref(data, ref):
+    """1路線だけ計算し直し、全国の集計も更新する。返り値はブラウザに返す差分。"""
+    ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
+    if not ways:
+        return None
+
+    graph = RouteGraph(ways)
+    start = graph.far_end()
+    node_dist = graph.dijkstra(start, [])[0] if start else None
+    recs = [r for r in read_records() if r["ref"] == ref]
+    nodes_here = route_points(ref, graph, node_dist, data.get("junctions") or {})
+    covered, sections, dates, notes = route_covered(ref, graph, recs, node_dist, nodes_here)
+
+    route_km = route_done_km = 0.0
+    for key, km in graph.edges.items():
+        route_km += km
+        if key in covered:
+            route_done_km += km
+            data["edgeKm"][key] = km
+
+    data["coveredByRef"][ref] = covered
+
+    row = next((s for s in data["summary"] if s["ref"] == ref), None)
+    if row is None:
+        return None
+    row.update({
+        "status": route_status(route_km, route_done_km, covered),
+        "km": round(route_km, 1),
+        "doneKm": round(route_done_km, 1),
+        "sections": sections,
+        "dates": sorted(set(dates)),
+        "notes": notes,
+    })
+
+    features = route_features(ref, ways, covered)
+    data["geojson"]["features"] = ([f for f in data["geojson"]["features"]
+                                    if f["properties"]["ref"] != ref] + features)
+    refresh_stats(data)
+    return {"summary": row, "features": features, "stats": data["stats"]}
+
+
+def refresh_stats(data):
+    """全国の走破距離を数え直す。重複区間を二重に数えないよう辺の和で持つ。"""
+    union = set()
+    for edges in data["coveredByRef"].values():
+        union |= edges
+    done_km = sum(data["edgeKm"].get(k, 0.0) for k in union)
+    summary = data["summary"]
+    data["stats"].update({
+        "doneKm": round(done_km),
+        "doneRoutes": sum(1 for s in summary if s["status"] == "done"),
+        "partialRoutes": sum(1 for s in summary if s["status"] == "partial"),
+        "ekiDone": sum(1 for e in data["eki"] if e[4]),
+    })
+
+
+class EditHandler(http.server.BaseHTTPRequestHandler):
+    """地図を配って、編集要求を CSV に書くだけのサーバ"""
+
+    data = None
+    lock = None
+
+    def log_message(self, fmt, *args):
+        pass          # アクセスログは出さない
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        raw = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            with self.lock:
+                html = render_html(self.data, editable=True)
+            self._send(200, html, "text/html; charset=utf-8")
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, json.dumps({"error": "壊れた要求です"}))
+            return
+
+        try:
+            with self.lock:
+                if self.path == "/api/eki":
+                    result = self._save_eki(payload)
+                elif self.path == "/api/section":
+                    result = self._save_section(payload)
+                else:
+                    self._send(404, json.dumps({"error": "not found"}))
+                    return
+        except Exception as e:                      # 保存に失敗しても地図は生かす
+            self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
+            return
+
+        self._send(200, json.dumps(result, ensure_ascii=False))
+
+    # -- 道の駅 ----------------------------------------------------------
+    def _save_eki(self, payload):
+        pref = (payload.get("pref") or "").strip()
+        name = eki_name(payload.get("name") or "")
+        date = (payload.get("date") or "").strip()
+        note = payload.get("note")
+        set_eki_visit(pref, name, date, note)
+
+        for e in self.data["eki"]:
+            if e[3] == pref and e[2] == name:
+                e[4] = 1 if date else 0
+                e[5] = date
+                if note is not None:
+                    e[6] = note
+                break
+        refresh_stats(self.data)
+        print(f"  道の駅 {pref} {name}: "
+              + (f"訪問 {date}" if date else "未訪問に戻しました"), file=sys.stderr)
+        return {"ok": True, "stats": self.data["stats"]}
+
+    # -- 国道の区間 ------------------------------------------------------
+    def _save_section(self, payload):
+        ref = str(payload.get("ref") or "").strip()
+        section = (payload.get("section") or "").strip()
+        if not ref.isdigit() or not section:
+            return {"ok": False, "error": "路線番号か区間が空です"}
+
+        append_route_row(ref, section, (payload.get("date") or "").strip(),
+                         (payload.get("note") or "").strip())
+        diff = recompute_ref(self.data, ref)
+        if diff is None:
+            return {"ok": False, "error": f"国道{ref}号を計算し直せませんでした"}
+        print(f"  国道{ref}号に「{section}」を追加しました "
+              f"({diff['summary']['doneKm']:.0f} / {diff['summary']['km']:.0f} km)",
+              file=sys.stderr)
+        return {"ok": True, **diff}
+
+
+def cmd_serve(args):
+    print("地図を組み立てています…（初回は1分ほどかかります）")
+    data = build_data()
+    if not data["summary"]:
+        print("描ける路線がありません。先に `python kokudo_map.py fetch` を実行してください。",
+              file=sys.stderr)
+        sys.exit(1)
+
+    EditHandler.data = data
+    EditHandler.lock = threading.Lock()
+    url = f"http://127.0.0.1:{args.port}/"
+
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), EditHandler)
+    except OSError as e:
+        print(f"ポート {args.port} を使えません（{e}）。"
+              f"`--port 8766` のように変えてください。", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n{url} で待ち受けています。ブラウザを開きます。")
+    print("  道の駅の丸を押すと訪問済みを切り替えられます。")
+    print("  交差点名を押して「ここから」→「ここまで」で区間を追加できます。")
+    print("  編集はその場で routes.csv / michinoeki.csv に書き込まれます。")
+    print("  終わるときは Ctrl+C。静的な HTML が要るときは build を実行してください。\n")
+    webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n終了しました。")
+        server.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -1462,6 +1929,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 7px 20px; background: none; border: 0; font: inherit; text-align: left; cursor: pointer;
   }
   .row:hover { background: #eef2f7; }
+
+  /* serve のときだけ出る編集用の帯とボタン */
+  #edit { display: none; padding: 10px 16px; border-bottom: 1px solid var(--rule);
+          background: #fff8e6; font-size: 11.5px; line-height: 1.7; }
+  #edit.on { display: block; }
+  #edit b { color: #a86400; }
+  .btn { font: inherit; font-size: 11px; padding: 3px 9px; margin: 2px 3px 0 0;
+         border: 1px solid var(--rule); border-radius: 5px; background: #fff;
+         color: var(--ink); cursor: pointer; }
+  .btn:hover { background: #eef2f7; }
+  .btn.go { background: var(--sign-blue); border-color: var(--sign-blue);
+            color: #fff; font-weight: 700; }
+  .btn.off { background: #fff; border-color: var(--done); color: var(--done); }
+  .leaflet-popup-content .btn { margin-top: 6px; }
   .row[aria-pressed="true"] { background: #e7edfa; box-shadow: inset 3px 0 0 var(--sign-blue); }
   .row[aria-pressed="true"] .name { color: var(--sign-blue); }
   .row:focus-visible { outline: 2px solid var(--sign-blue); outline-offset: -2px; }
@@ -1532,6 +2013,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <input type="checkbox" id="showEki"><span>道の駅を出す</span>
       </label>
     </div>
+    <div id="edit"></div>
     <div class="filters">
       <button data-filter="all" aria-pressed="true">すべて</button>
       <button data-filter="done" aria-pressed="false">走破済み</button>
@@ -1543,6 +2025,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div><i style="background:var(--done)"></i>走破済み</div>
       <div><i style="background:var(--todo)"></i>未走破</div>
       <div><b style="color:var(--done)">●</b> 訪問済みの道の駅　<b style="color:var(--todo)">●</b> 未訪問</div>
+      <div style="margin-top:6px"><b style="color:#0b3f8f">●</b> 信号交差点　<b style="color:#0f7b4f">◆</b> 国道どうしの交点　<b style="color:#111827">◆</b> 路線の端</div>
       <div style="margin-top:6px">一覧の番号を押すとその国道だけが色濃く出ます（もう一度押すと解除）</div>
       <div>交差点名をクリックすると区間欄用の書き方が出ます</div>
     </div>
@@ -1551,6 +2034,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+// スクリプトが途中で止まると地図が半分だけ描かれた状態になり、原因が分からない。
+// 気づけるように画面へ出す。
+window.addEventListener("error", (ev) => {
+  const box = document.createElement("div");
+  box.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:9999;"
+    + "background:#d81f26;color:#fff;padding:10px 14px;"
+    + "font:12px/1.6 ui-monospace,monospace;white-space:pre-wrap";
+  box.textContent = "地図の読み込みでエラーが起きました。\n"
+    + (ev.message || ev.error || "") + "\n"
+    + (ev.filename || "") + " " + (ev.lineno || "") + "行目";
+  document.body.appendChild(box);
+});
+
 const GEOJSON = __GEOJSON__;
 const SUMMARY = __SUMMARY__;
 const STATS = __STATS__;
@@ -1592,15 +2088,30 @@ function setBasemap(key) {
   baseLayer.bringToBack();
 }
 
-// 未走破を下、走破済みを上に固定する
-map.createPane("todoPane").style.zIndex = 410;
-map.createPane("donePane").style.zIndex = 420;
+// 線も道の駅も1枚のキャンバスに描く。
+// pane を分けるとキャンバスも分かれ、上の pane が下の線へのクリックを飲み込む。
+// 1枚なら Leaflet が描画順（あとに足したものが上）で当たり判定をしてくれる。
+map.createPane("featPane").style.zIndex = 420;
+const featRenderer = L.canvas({ pane: "featPane", padding: 0.3, tolerance: 10 });
 
 // 選択した路線の縁取り。線そのものより下に敷いて，赤／グレーを潰さない
 map.createPane("selPane").style.zIndex = 405;
 
 const COLORS = CONFIG.colors;
 let selectedRef = null;
+
+// 編集用の状態。道の駅レイヤがこれらを使うので、必ずレイヤ生成より前に置くこと。
+const EDITABLE = !!CONFIG.editable;
+const editEl = document.getElementById("edit");
+const ekiMarkers = [];          // EKI と同じ並びのマーカー
+let pending = null;             // 区間の始点として選んだ交差点
+let popupNode = null;           // いま開いている交差点のポップアップの地点
+let lineLatLng = null;          // 線をクリックした場所（任意の点の指定に使う）
+
+// 地点の種類。0=名前付き 1=信号 2=国道の交点 3=路線の端
+const PT_COLOR = ["#8a96a3", "#0b3f8f", "#0f7b4f", "#111827"];
+const NAME_SEP = "__NAME_SEP__";   // 1地点に複数の呼び名が付くときの区切り
+const PT_SIZE = [2.2, 3, 3.8, 4.2];
 
 function esc(text) {
   return String(text).replace(/[&<>"]/g, c =>
@@ -1622,13 +2133,11 @@ const layerSel = L.geoJSON(null, {
   interactive: false
 }).addTo(map);
 const layerTodo = L.geoJSON(null, {
-  pane: "todoPane", renderer: L.canvas({ pane: "todoPane" }),
-  style: todoStyle
+  pane: "featPane", renderer: featRenderer, style: todoStyle
 });
 const layerDone = L.geoJSON(null, {
-  pane: "donePane", renderer: L.canvas({ pane: "donePane" }),
-  style: doneStyle
-}).addTo(map);
+  pane: "featPane", renderer: featRenderer, style: doneStyle
+});
 
 // 選択を地図と一覧の両方に反映する
 function refreshSelection() {
@@ -1661,11 +2170,12 @@ for (const f of GEOJSON.features) {
   (f.properties.kind === "done" ? layerDone : layerTodo).addData(f);
 }
 
+const STATUS_LABEL = { done: "全線走破", partial: "一部走破", todo: "未走破" };
+
 function popupHtml(s) {
-  const label = { done: "全線走破", partial: "一部走破", todo: "未走破" }[s.status];
   const bits = [
     `<strong style="font-size:14px">国道${s.ref}号</strong>`,
-    `${label}　${s.doneKm.toLocaleString()} / ${s.km.toLocaleString()} km`
+    `${STATUS_LABEL[s.status]}　${s.doneKm.toLocaleString()} / ${s.km.toLocaleString()} km`
   ];
   if (s.sections.length) bits.push(`区間: ${s.sections.join(" ／ ")}`);
   if (s.dates.length) bits.push(`走破日: ${s.dates.join(", ")}`);
@@ -1673,32 +2183,99 @@ function popupHtml(s) {
   return bits.join("<br>");
 }
 
+// 点と線分の距離の2乗（画面座標）
+function segDist2(p, a, b) {
+  const bx = b.x - a.x, by = b.y - a.y;
+  const d2 = bx * bx + by * by;
+  const t = d2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * bx + (p.y - a.y) * by) / d2)) : 0;
+  const dx = p.x - (a.x + t * bx), dy = p.y - (a.y + t * by);
+  return dx * dx + dy * dy;
+}
+
+// その地点を通っている国道をすべて拾う。
+// Leaflet のクリックは最前面の1本しか返さないので、重複区間では
+// どの国道として記録するのか選べない。当たり判定を自分で全レイヤに掛ける。
+//
+// 重複区間でも路線ごとに独立して線を間引いているため、同じ道でも描かれた線が
+// 数十mずれることがある（実測で 17% が 15m 以上）。画素固定の判定だと
+// 拡大するほど取りこぼすので、40m 相当を目安にズームで換算する。
+function routesAtPoint(latlng) {
+  const p = map.latLngToLayerPoint(latlng);
+  const mPerPx = 156543.03 * Math.cos(latlng.lat * Math.PI / 180) / Math.pow(2, map.getZoom());
+  const tol = Math.min(25, Math.max(6, 40 / mPerPx));
+  const tol2 = tol * tol;
+
+  const refs = new Set();
+  for (const layer of [layerDone, layerTodo]) {
+    if (!map.hasLayer(layer)) continue;
+    layer.eachLayer(l => {
+      const ref = l.feature && l.feature.properties.ref;
+      if (!ref || refs.has(ref) || !l._parts) return;
+      for (const part of l._parts) {
+        for (let i = 1; i < part.length; i++) {
+          if (segDist2(p, part[i - 1], part[i]) <= tol2) {
+            refs.add(ref);
+            return;
+          }
+        }
+      }
+    });
+  }
+  return [...refs].sort((a, b) => Number(a) - Number(b));
+}
+
+// 線の上の好きな場所を区間端にできる。重複区間では国道ごとにボタンを出す。
+function linePopupHtml(refs) {
+  const rows = refs.map(ref => {
+    const s = byRef[ref];
+    if (!s) return "";
+    const act = !EDITABLE ? ""
+      : (pending && pending.ref === ref
+        ? `<button class="btn go" data-pt-finish="${ref}">ここまで</button>`
+        : `<button class="btn" data-pt-start="${ref}">ここから</button>`);
+    return `<tr><td style="padding-right:9px"><b>国道${ref}号</b></td>`
+      + `<td style="padding-right:9px">${STATUS_LABEL[s.status]}　`
+      + `${s.doneKm.toLocaleString()} / ${s.km.toLocaleString()} km</td>`
+      + `<td>${act}</td></tr>`;
+  }).join("");
+
+  const bits = [`<strong style="font-size:13px">この地点を通る国道</strong>`
+    + `<table style="font-size:11.5px;margin:6px 0 2px;border-collapse:collapse">`
+    + `${rows}</table>`];
+  if (refs.length === 1) {
+    const s = byRef[refs[0]];
+    if (s && s.sections.length) bits.push(`<span style="font-size:11px">区間: ${s.sections.join(" ／ ")}</span>`);
+    if (s && s.dates.length) bits.push(`<span style="font-size:11px">走破日: ${s.dates.join(", ")}</span>`);
+    if (s && s.notes.length) bits.push(`<span style="font-size:11px">${esc(s.notes.join(" / "))}</span>`);
+  }
+  return bits.join("<br>");
+}
+
 for (const layer of [layerDone, layerTodo]) {
   layer.on("click", (e) => {
-    const s = byRef[e.layer.feature.properties.ref];
-    if (s) L.popup().setLatLng(e.latlng).setContent(popupHtml(s)).openOn(map);
+    lineLatLng = e.latlng;
+    let refs = routesAtPoint(e.latlng);
+    if (!refs.length && e.layer.feature) refs = [e.layer.feature.properties.ref];
+    if (refs.length) {
+      L.popup().setLatLng(e.latlng).setContent(linePopupHtml(refs)).openOn(map);
+    }
   });
 }
 
 // ---- 道の駅 ----
 // 千駅ほどなので、交差点名と違って普通のマーカーで足りる。
-map.createPane("ekiPane").style.zIndex = 435;
-const ekiRenderer = L.canvas({ pane: "ekiPane", padding: 0.3 });
-const layerEki = L.layerGroup([], { pane: "ekiPane" });
+const layerEki = L.layerGroup([], { pane: "featPane" });
 
-for (const e of EKI) {
+EKI.forEach((e, i) => {
   const been = e[4];
-  L.circleMarker([e[0], e[1]], {
-    pane: "ekiPane", renderer: ekiRenderer, radius: been ? 6 : 5,
+  const marker = L.circleMarker([e[0], e[1]], {
+    pane: "featPane", renderer: featRenderer, radius: been ? 6 : 5,
     color: "#fff", weight: 1.6, opacity: 0.95,
     fillColor: been ? COLORS.done : COLORS.todo, fillOpacity: been ? 1 : 0.8
-  }).bindPopup(
-    `<strong style="font-size:13px">道の駅 ${esc(e[2])}</strong>` +
-    `<br><span style="font-size:11px;color:#6c7a89">${esc(e[3])}</span>` +
-    (been ? `<br>訪問: ${esc(e[5])}` : `<br><span style="color:#6c7a89">未訪問</span>`) +
-    (e[6] ? `<br>${esc(e[6])}` : "")
-  ).addTo(layerEki);
-}
+  }).addTo(layerEki);
+  marker.bindPopup(() => ekiPopup(i));
+  ekiMarkers[i] = marker;
+});
 
 // ---- 交差点名の注記 ----
 // 数万地点あるのでマーカーは使わず、表示範囲に入るぶんだけキャンバスに描く。
@@ -1784,12 +2361,21 @@ function drawLabels() {
   const boxes = [];
   for (const n of found) {
     const p = map.latLngToContainerPoint([n[0], n[1]]);
+    const r = PT_SIZE[n[3]] || 2.2;
     lctx.beginPath();
-    lctx.arc(p.x, p.y, n[3] ? 3 : 2.2, 0, Math.PI * 2);
+    if (n[3] >= 2) {          // 算出した地点はひし形にして一目で分かるようにする
+      lctx.moveTo(p.x, p.y - r);
+      lctx.lineTo(p.x + r, p.y);
+      lctx.lineTo(p.x, p.y + r);
+      lctx.lineTo(p.x - r, p.y);
+      lctx.closePath();
+    } else {
+      lctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    }
     lctx.strokeStyle = "rgba(255,255,255,.9)";
     lctx.lineWidth = 1.4;
     lctx.stroke();
-    lctx.fillStyle = n[3] ? "#0b3f8f" : "#8a96a3";
+    lctx.fillStyle = PT_COLOR[n[3]] || "#8a96a3";
     lctx.fill();
     if (!withText) continue;
 
@@ -1849,20 +2435,31 @@ map.on("click", (e) => {
   }
   if (!best) return;
   const n = best.n;
+  popupNode = n;
   const name = esc(n[2]);
+  const canon = esc(n[2].split(NAME_SEP)[0]);
+  const here = `${canon}@${n[0]}/${n[1]}`;
   const rows = (n[4] || []).map(pair => {
     const km = pair[1];
+    // 分断された区間の地点は端からの距離が測れない。そこは座標で位置を示す。
     const paste = km === null
-      ? '<span style="color:#6c7a89">距離不明</span>'
-      : `${km} km　<code>${name}@${km}</code>`;
-    return `<tr><td style="padding-right:10px">国道${pair[0]}号</td><td>${paste}</td></tr>`;
+      ? `<span style="color:#6c7a89">距離不明</span>　<code>${here}</code>`
+      : `${km} km　<code>${canon}@${km}</code>`;
+    let act = "";
+    if (EDITABLE) {
+      act = (pending && pending.ref === pair[0])
+        ? `<button class="btn go" data-finish="${pair[0]}">ここまで</button>`
+        : `<button class="btn" data-start="${pair[0]}">ここから</button>`;
+    }
+    return `<tr><td style="padding-right:10px">国道${pair[0]}号</td>`
+      + `<td style="padding-right:8px">${paste}</td><td>${act}</td></tr>`;
   }).join("");
   L.popup().setLatLng([n[0], n[1]]).setContent(
     `<strong style="font-size:13px">${name}</strong>` +
     (n[3] ? "　信号交差点" : "") +
     `<table style="font-size:11px;margin:6px 0 4px;border-collapse:collapse">${rows}</table>` +
     `<span style="font-size:11px;color:#6c7a89">どの路線でも: </span>` +
-    `<code style="font-size:11px">${name}@${n[0]},${n[1]}</code>`
+    `<code style="font-size:11px">${canon}@${n[0]}/${n[1]}</code>`
   ).openOn(map);
 });
 
@@ -1932,6 +2529,165 @@ for (const btn of document.querySelectorAll(".filters button")) {
   });
 }
 
+// ---- 編集（serve のときだけ動く） ----
+// 変数の宣言は道の駅レイヤより前で済ませてある（下の「編集用の状態」参照）。
+// ここに const で置くと、レイヤ生成時にまだ初期化されておらず地図全体が止まる。
+
+function today() {
+  const d = new Date();
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const out = await res.json().catch(() => ({ error: "応答を読めませんでした" }));
+  if (!res.ok || out.error) throw new Error(out.error || `保存に失敗しました (${res.status})`);
+  return out;
+}
+
+function showEdit(html) {
+  editEl.innerHTML = html;
+  editEl.classList.toggle("on", !!html);
+}
+
+function refreshStats(stats) {
+  Object.assign(STATS, stats);
+  const pc = STATS.totalKm ? (STATS.doneKm / STATS.totalKm * 100) : 0;
+  document.getElementById("pct").textContent = pc.toFixed(1);
+  document.getElementById("bar").style.width = Math.max(pc, 0.4) + "%";
+  document.getElementById("detail").innerHTML =
+    `${STATS.doneKm.toLocaleString()} / ${STATS.totalKm.toLocaleString()} km<br>` +
+    `全線走破 ${STATS.doneRoutes} 本・一部走破 ${STATS.partialRoutes} 本 / 収録 ${STATS.totalRoutes} 本` +
+    (STATS.ekiTotal
+      ? `<br>道の駅 ${STATS.ekiDone.toLocaleString()} / ${STATS.ekiTotal.toLocaleString()} 駅`
+        + `（${(STATS.ekiDone / STATS.ekiTotal * 100).toFixed(1)}%）`
+      : "");
+}
+
+// -- 道の駅 --------------------------------------------------------------
+function ekiPopup(i) {
+  const e = EKI[i];
+  const been = e[4];
+  return `<strong style="font-size:13px">道の駅 ${esc(e[2])}</strong>` +
+    `<br><span style="font-size:11px;color:#6c7a89">${esc(e[3])}</span>` +
+    (been ? `<br>訪問: ${esc(e[5])}` : `<br><span style="color:#6c7a89">未訪問</span>`) +
+    (e[6] ? `<br>${esc(e[6])}` : "") +
+    (EDITABLE
+      ? `<br><button class="btn ${been ? "off" : "go"}" data-eki="${i}">`
+        + (been ? "訪問を取り消す" : "行った") + `</button>`
+      : "");
+}
+
+async function toggleEki(i) {
+  const e = EKI[i], marker = ekiMarkers[i];
+  if (!e || !marker) return;
+  const been = e[4];
+  const date = been ? "" : today();
+  const out = await post("/api/eki", { pref: e[3], name: e[2], date: date });
+  e[4] = been ? 0 : 1;
+  e[5] = date;
+  marker.setStyle({
+    fillColor: e[4] ? COLORS.done : COLORS.todo,
+    fillOpacity: e[4] ? 1 : 0.8, radius: e[4] ? 6 : 5
+  });
+  marker.setPopupContent(ekiPopup(i));
+  refreshStats(out.stats);
+}
+
+// -- 国道の区間 ----------------------------------------------------------
+// label は画面に出す名前、text は routes.csv に書く形（名前@km または @緯度,経度）
+function startSection(ref, label, text) {
+  pending = { ref: ref, label: label, text: text };
+  showEdit(`国道${ref}号 <b>${esc(label)}</b> から<br>` +
+    `もう一方の地点を押して「ここまで」を選んでください` +
+    `<br><button class="btn" data-cancel="1">やめる</button>`);
+  map.closePopup();
+}
+
+async function finishSection(ref, label, text) {
+  if (!pending || pending.ref !== ref) return;
+  const a = pending, b = { label: label, text: text };
+  pending = null;
+  showEdit(`国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b> を保存しています…`);
+  const section = `${a.text}〜${b.text}`;
+  try {
+    const out = await post("/api/section", { ref: ref, section: section, date: today() });
+    applyRouteUpdate(ref, out);
+    showEdit(`国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b> を追加しました`
+      + `（${out.summary.doneKm.toLocaleString()} / ${out.summary.km.toLocaleString()} km）`
+      + `<br><button class="btn" data-cancel="1">閉じる</button>`);
+    map.closePopup();
+  } catch (err) {
+    showEdit(`<b>保存できませんでした</b><br>${esc(err.message)}`
+      + `<br><button class="btn" data-cancel="1">閉じる</button>`);
+  }
+}
+
+function applyRouteUpdate(ref, out) {
+  for (const layer of [layerDone, layerTodo]) {
+    const kill = [];
+    layer.eachLayer(l => {
+      if (l.feature && l.feature.properties.ref === ref) kill.push(l);
+    });
+    for (const l of kill) layer.removeLayer(l);
+  }
+  GEOJSON.features = GEOJSON.features.filter(f => f.properties.ref !== ref);
+  for (const f of out.features) {
+    GEOJSON.features.push(f);
+    (f.properties.kind === "done" ? layerDone : layerTodo).addData(f);
+  }
+  const i = SUMMARY.findIndex(s => s.ref === ref);
+  if (i >= 0) SUMMARY[i] = out.summary;
+  byRef[ref] = out.summary;
+  refreshStats(out.stats);
+  if (selectedRef === ref) refreshSelection();
+  render();
+}
+
+// 地図・ポップアップ・帯のボタンをまとめて受ける
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-eki], button[data-start], " +
+                               "button[data-finish], button[data-cancel], " +
+                               "button[data-pt-start], button[data-pt-finish]");
+  if (!btn) return;
+  ev.preventDefault();
+  const fail = (err) =>
+    showEdit(`<b>保存できませんでした</b><br>${esc(err.message)}`
+      + `<br><button class="btn" data-cancel="1">閉じる</button>`);
+
+  if (btn.hasAttribute("data-cancel")) {
+    pending = null;
+    showEdit("");
+  } else if (btn.hasAttribute("data-eki")) {
+    toggleEki(Number(btn.dataset.eki)).catch(fail);
+  } else if (btn.hasAttribute("data-start") || btn.hasAttribute("data-finish")) {
+    const ref = btn.dataset.start || btn.dataset.finish;
+    const pair = popupNode && (popupNode[4] || []).find(x => x[0] === ref);
+    if (!pair) return;
+    // 1つの地点に複数の呼び名が付いていることがある（「R363×R419／R419端(北)」）。
+    // 区間欄には結合前の名前を書かないと突き合わせに失敗する。
+    const canon = popupNode[2].split(NAME_SEP)[0];
+    // 距離が測れない地点（分断された区間）は座標で位置を確定させる
+    const text = pair[1] === null
+      ? `${canon}@${popupNode[0]}/${popupNode[1]}`
+      : `${canon}@${pair[1]}`;
+    if (btn.hasAttribute("data-start")) startSection(ref, popupNode[2], text);
+    else finishSection(ref, popupNode[2], text).catch(fail);
+  } else if (btn.hasAttribute("data-pt-start") || btn.hasAttribute("data-pt-finish")) {
+    if (!lineLatLng) return;
+    const ref = btn.dataset.ptStart || btn.dataset.ptFinish;
+    const lat = lineLatLng.lat.toFixed(5), lon = lineLatLng.lng.toFixed(5);
+    const text = `@${lat}/${lon}`;
+    const label = `地点(${lat},${lon})`;
+    if (btn.hasAttribute("data-pt-start")) startSection(ref, label, text);
+    else finishSection(ref, label, text).catch(fail);
+  }
+});
+
 // ---- 表示設定 ----
 const basemapEl = document.getElementById("basemap");
 const opacityEl = document.getElementById("opacity");
@@ -1950,9 +2706,17 @@ basemapEl.addEventListener("change", () => setBasemap(basemapEl.value));
 opacityEl.addEventListener("input", () => {
   if (baseLayer) baseLayer.setOpacity(Number(opacityEl.value) / 100);
 });
-showTodoEl.addEventListener("change", () => {
+// 1枚のキャンバスでは「あとに足したもの」が上に来る。
+// 未走破 → 走破済み → 道の駅 の順を保つため、切り替えのたびに積み直す。
+function stackLayers() {
+  for (const l of [layerTodo, layerDone, layerEki]) map.removeLayer(l);
   if (showTodoEl.checked) layerTodo.addTo(map);
-  else map.removeLayer(layerTodo);
+  layerDone.addTo(map);
+  if (showEkiEl.checked) layerEki.addTo(map);
+}
+
+showTodoEl.addEventListener("change", () => {
+  stackLayers();
   refreshSelection();
 });
 
@@ -1967,14 +2731,10 @@ showNodesEl.addEventListener("change", () => {
   nodesOn = showNodesEl.checked;
   drawLabels();
 });
-showEkiEl.addEventListener("change", () => {
-  if (showEkiEl.checked) layerEki.addTo(map);
-  else map.removeLayer(layerEki);
-});
+showEkiEl.addEventListener("change", stackLayers);
 
 setBasemap(basemapEl.value);
-if (showTodoEl.checked) layerTodo.addTo(map);
-if (showEkiEl.checked) layerEki.addTo(map);
+stackLayers();
 drawLabels();
 
 render();
@@ -2005,6 +2765,10 @@ def main():
 
     p = sub.add_parser("build", help="地図 HTML を生成する")
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("serve", help="地図から履歴を編集できる状態で開く")
+    p.add_argument("--port", type=int, default=SERVE_PORT, help=f"既定 {SERVE_PORT}")
+    p.set_defaults(func=cmd_serve)
 
     args = parser.parse_args()
     args.func(args)
