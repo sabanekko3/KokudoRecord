@@ -641,6 +641,38 @@ def parse_section(text):
     return None
 
 
+def parse_row(raw_ref, raw_section, date, note, line_no=0, quiet=False):
+    """routes.csv の1行を、区間指定の並びに変える。
+
+    `新潟県/富山県` のようなまとめ書きは複数に分かれる。
+    `read_records()`（全体の読み込み）と `serve`（1行だけの下見）で共用する。
+    """
+    ref = (raw_ref or "").strip().lstrip("Rr国道").rstrip("号").strip()
+    if not ref.isdigit():
+        if not quiet:
+            print(f"  {line_no}行目: 路線番号「{raw_ref}」を読めないので飛ばします",
+                  file=sys.stderr)
+        return []
+
+    text = (raw_section or FULL).strip() or FULL
+    # 交差点指定は分解しない
+    items = ([text] if SEP_RE.search(text)
+             else [p.strip() for p in text.replace("・", "/").split("/") if p.strip()])
+
+    out = []
+    for item in items:
+        sec = parse_section(item)
+        if sec is None:
+            if not quiet:
+                print(f"  {line_no}行目: 区間「{item}」を解釈できません。"
+                      f"都道府県名から書くか，交差点名を「A〜B」の形にしてください。",
+                      file=sys.stderr)
+            continue
+        sec.update({"ref": ref, "date": date, "note": note, "line": line_no})
+        out.append(sec)
+    return out
+
+
 def read_records():
     if not os.path.exists(CSV_PATH):
         print(f"{CSV_PATH} がありません。先に `python kokudo_map.py init` を実行してください。",
@@ -650,30 +682,13 @@ def read_records():
     records = []
     with open(CSV_PATH, encoding="utf-8-sig", newline="") as f:
         for line_no, row in enumerate(csv.DictReader(f), start=2):
-            raw_ref = (row.get("路線番号") or "").strip()
-            if not raw_ref:
+            if not (row.get("路線番号") or "").strip():
                 continue
-            ref = raw_ref.lstrip("Rr国道").rstrip("号").strip()
-            if not ref.isdigit():
-                print(f"  {line_no}行目: 路線番号「{raw_ref}」を読めないので飛ばします", file=sys.stderr)
-                continue
-
-            raw_section = (row.get("区間") or FULL).strip() or FULL
-            date = (row.get("走破日") or "").strip()
-            note = (row.get("メモ") or "").strip()
-
-            # 「新潟県/富山県」のようなまとめ書きを分解する（交差点指定は分解しない）
-            items = ([raw_section] if SEP_RE.search(raw_section)
-                     else [p.strip() for p in raw_section.replace("・", "/").split("/") if p.strip()])
-
-            for item in items:
-                sec = parse_section(item)
-                if sec is None:
-                    print(f"  {line_no}行目: 区間「{item}」を解釈できません。"
-                          f"都道府県名から書くか，交差点名を「A〜B」の形にしてください。", file=sys.stderr)
-                    continue
-                sec.update({"ref": ref, "date": date, "note": note, "line": line_no})
-                records.append(sec)
+            records.extend(parse_row(row.get("路線番号"),
+                                     row.get("区間"),
+                                     (row.get("走破日") or "").strip(),
+                                     (row.get("メモ") or "").strip(),
+                                     line_no))
     return records
 
 
@@ -1596,7 +1611,8 @@ def render_html(data, editable=False):
             .replace("__DONE_COLOR__", DONE_COLOR)
             .replace("__TODO_COLOR__", TODO_COLOR)
             .replace("__SELECT_COLOR__", SELECT_COLOR)
-            .replace("__NAME_SEP__", NAME_SEP))
+            .replace("__NAME_SEP__", NAME_SEP)
+            .replace("__PING_MS__", str(int(PING_INTERVAL * 1000))))
 
 
 def cmd_build(args):
@@ -1639,6 +1655,49 @@ def cmd_build(args):
 # 全路線の再計算は40秒ほどかかるので、編集された1路線だけ計算し直して差分を返す。
 
 SERVE_PORT = 8765
+# 地図の画面から何秒ごとに生存を知らせてもらうか
+PING_INTERVAL = 5.0
+# タブが閉じられた合図を受けてから、実際に終了するまでの猶予 [秒]。
+# 読み込み直しでも同じ合図が飛ぶので、すぐ落とすと再読込で終了してしまう。
+BYE_GRACE = 8.0
+# 画面から何も言ってこなくなってから終了するまで [秒]。
+# ブラウザは裏のタブのタイマーを1分程度まで間引くので、短くしすぎないこと。
+IDLE_TIMEOUT = 900.0
+
+
+ROUTE_HEADER = ["路線番号", "区間", "走破日", "メモ"]
+
+
+def read_route_rows():
+    """routes.csv を1行ずつそのまま読む（一覧表示と編集用）。
+
+    `read_records()` と違い、解釈せずに書いてあるまま返す。
+    行の位置がそのまま識別子になる。
+    """
+    rows = []
+    if not os.path.exists(CSV_PATH):
+        return rows
+    with open(CSV_PATH, encoding="utf-8-sig", newline="") as f:
+        for i, row in enumerate(csv.DictReader(f)):
+            if not any((row.get(c) or "").strip() for c in ROUTE_HEADER):
+                continue
+            rows.append({"index": i,
+                         "ref": (row.get("路線番号") or "").strip(),
+                         "section": (row.get("区間") or "").strip(),
+                         "date": (row.get("走破日") or "").strip(),
+                         "note": (row.get("メモ") or "").strip()})
+    return rows
+
+
+def write_route_rows(rows):
+    """routes.csv を書き直す。書き損じないよう別名で書いてから置き換える。"""
+    tmp = CSV_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(ROUTE_HEADER)
+        for r in rows:
+            w.writerow([r["ref"], r["section"], r["date"], r["note"]])
+    os.replace(tmp, CSV_PATH)
 
 
 def append_route_row(ref, section, date, note):
@@ -1739,9 +1798,22 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
 
     data = None
     lock = None
+    server_ref = None       # 自分を止めるためのサーバ本体
+    last_seen = 0.0         # 地図の画面から最後に合図が来た時刻
+    goodbye_at = 0.0        # タブが閉じられた合図が来た時刻
+    stopping = False
 
     def log_message(self, fmt, *args):
         pass          # アクセスログは出さない
+
+    @classmethod
+    def stop(cls, why):
+        """待ち受けをやめる。別のスレッドから止めないと自分を待って固まる。"""
+        if cls.stopping or cls.server_ref is None:
+            return
+        cls.stopping = True
+        print(why, file=sys.stderr)
+        threading.Thread(target=cls.server_ref.shutdown, daemon=True).start()
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         raw = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -1757,6 +1829,10 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
             with self.lock:
                 html = render_html(self.data, editable=True)
             self._send(200, html, "text/html; charset=utf-8")
+        elif self.path == "/api/records":
+            with self.lock:
+                rows = read_route_rows()
+            self._send(200, json.dumps({"rows": rows}, ensure_ascii=False))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -1774,6 +1850,22 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
                     result = self._save_eki(payload)
                 elif self.path == "/api/section":
                     result = self._save_section(payload)
+                elif self.path == "/api/record":
+                    result = self._edit_record(payload)
+                elif self.path == "/api/preview":
+                    result = self._preview_record(payload)
+                elif self.path == "/api/ping":
+                    # 地図の画面が生きている合図。読み込み直しならここで戻る
+                    EditHandler.last_seen = time.time()
+                    EditHandler.goodbye_at = 0.0
+                    result = {"ok": True}
+                elif self.path == "/api/bye":
+                    # タブが閉じられた（か、読み込み直された）
+                    EditHandler.goodbye_at = time.time()
+                    result = {"ok": True}
+                elif self.path == "/api/quit":
+                    result = {"ok": True}
+                    EditHandler.stop("\n地図の「終了」が押されました。終了します。")
                 else:
                     self._send(404, json.dumps({"error": "not found"}))
                     return
@@ -1820,6 +1912,92 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
               file=sys.stderr)
         return {"ok": True, **diff}
 
+    # -- 記録1件がどこを指しているか --------------------------------------
+    def _preview_record(self, payload):
+        """その行の区間だけを辺に直し、地図に重ねる形と範囲を返す"""
+        rows = read_route_rows()
+        target = next((r for r in rows if r["index"] == payload.get("index")), None)
+        if target is None or target["section"] != (payload.get("section") or ""):
+            return {"ok": False, "error": "記録が変わっています。一覧を開き直してください"}
+
+        secs = parse_row(target["ref"], target["section"],
+                         target["date"], target["note"], quiet=True)
+        if not secs:
+            return {"ok": False, "error": "この区間は解釈できません"}
+
+        ref = secs[0]["ref"]
+        ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
+        if not ways:
+            return {"ok": False, "error": f"国道{ref}号の形状がありません"}
+
+        graph = RouteGraph(ways)
+        start = graph.far_end()
+        node_dist = graph.dijkstra(start, [])[0] if start else None
+        nodes = route_points(ref, graph, node_dist, self.data.get("junctions") or {})
+        covered, _sections, _dates, _notes = route_covered(ref, graph, secs, node_dist, nodes)
+        if not covered:
+            return {"ok": False, "error": "この区間は地図上で特定できませんでした"}
+
+        feats = [f for f in route_features(ref, ways, covered)
+                 if f["properties"]["kind"] == "done"]
+        pts = [p for f in feats for line in f["geometry"]["coordinates"] for p in line]
+        if not pts:
+            return {"ok": False, "error": "この区間は地図上で特定できませんでした"}
+        return {"ok": True, "ref": ref, "features": feats,
+                "km": round(sum(graph.edges[e] for e in covered), 1),
+                "bounds": [[min(p[1] for p in pts), min(p[0] for p in pts)],
+                           [max(p[1] for p in pts), max(p[0] for p in pts)]]}
+
+    # -- 記録の書き換えと削除 --------------------------------------------
+    def _edit_record(self, payload):
+        action = payload.get("action")
+        index = payload.get("index")
+        rows = read_route_rows()
+        target = next((r for r in rows if r["index"] == index), None)
+
+        # 一覧を開いたあとにファイルが変わっていたら、取り違えないよう断る
+        if target is None or target["section"] != (payload.get("section") or ""):
+            return {"ok": False, "error": "記録が変わっています。一覧を開き直してください",
+                    "rows": rows}
+
+        ref = target["ref"]
+        if action == "delete":
+            rows = [r for r in rows if r["index"] != index]
+            print(f"  国道{ref}号の「{target['section']}」を削除しました", file=sys.stderr)
+        elif action == "update":
+            target["date"] = (payload.get("date") or "").strip()
+            target["note"] = (payload.get("note") or "").strip()
+            print(f"  国道{ref}号の「{target['section']}」を更新しました"
+                  f"（走破日 {target['date'] or '空'}）", file=sys.stderr)
+        else:
+            return {"ok": False, "error": "不明な操作です"}
+
+        write_route_rows(rows)
+        out = {"ok": True, "rows": read_route_rows()}
+        if ref.isdigit():
+            diff = recompute_ref(self.data, ref)
+            if diff:
+                out.update(diff)
+        return out
+
+
+def watch_browser():
+    """地図の画面が閉じられたら、こちらも終了する。
+
+    合図が来ないまま終了すると、ブラウザを開く前に落ちてしまう。
+    いちども合図が来ていないうちは何もしない。
+    """
+    while not EditHandler.stopping:
+        time.sleep(1.0)
+        now = time.time()
+        bye, seen = EditHandler.goodbye_at, EditHandler.last_seen
+        if bye and now - bye > BYE_GRACE and seen < bye:
+            EditHandler.stop("\n地図のタブが閉じられました。終了します。")
+            return
+        if seen and now - seen > IDLE_TIMEOUT:
+            EditHandler.stop("\nしばらく画面から応答がないので終了します。")
+            return
+
 
 def cmd_serve(args):
     print("地図を組み立てています…（初回は1分ほどかかります）")
@@ -1839,18 +2017,22 @@ def cmd_serve(args):
         print(f"ポート {args.port} を使えません（{e}）。"
               f"`--port 8766` のように変えてください。", file=sys.stderr)
         sys.exit(1)
+    EditHandler.server_ref = server
 
     print(f"\n{url} で待ち受けています。ブラウザを開きます。")
     print("  道の駅の丸を押すと訪問済みを切り替えられます。")
     print("  交差点名を押して「ここから」→「ここまで」で区間を追加できます。")
     print("  編集はその場で routes.csv / michinoeki.csv に書き込まれます。")
-    print("  終わるときは Ctrl+C。静的な HTML が要るときは build を実行してください。\n")
+    print("\n  終わるときは、地図の右上の「終了」を押すか、ブラウザのタブを閉じてください。")
+    print("  この画面は自動で閉じます。\n")
     webbrowser.open(url)
+    threading.Thread(target=watch_browser, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n終了しました。")
-        server.shutdown()
+        EditHandler.stop("\n終了します。")
+    server.server_close()
+    print("終了しました。")
 
 
 # --------------------------------------------------------------------------
@@ -1890,6 +2072,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     background: var(--panel); border-left: 1px solid var(--rule);
   }
   header { padding: 18px 20px 14px; border-bottom: 1px solid var(--rule); }
+  .titlebar { display: flex; align-items: flex-start; gap: 10px; }
+  .titlebar > div { flex: 1; min-width: 0; }
+  #quit {
+    flex: none; font: inherit; font-size: 11px; padding: 4px 12px; cursor: pointer;
+    border: 1px solid var(--rule); border-radius: 5px; background: #fff; color: var(--muted);
+  }
+  #quit:hover { background: var(--done); border-color: var(--done); color: #fff; }
+  #quit:focus-visible { outline: 2px solid var(--sign-blue); outline-offset: 2px; }
+  #quit[hidden] { display: none; }
+
+  /* 終了したあとにかぶせる案内 */
+  #bye {
+    position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center;
+    background: rgba(251,252,253,.96); text-align: center; padding: 24px;
+  }
+  #bye b { display: block; font-size: 17px; margin-bottom: 10px; }
+  #bye span { font-size: 12.5px; color: var(--muted); line-height: 1.9; }
   h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: .08em; }
   .tagline { margin: 4px 0 0; font-size: 11px; color: var(--muted); letter-spacing: .04em; }
 
@@ -1922,6 +2121,42 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .filters button[aria-pressed="true"] { background: var(--sign-blue); border-color: var(--sign-blue); color: #fff; font-weight: 700; }
   .filters button:focus-visible { outline: 2px solid var(--sign-blue); outline-offset: 2px; }
+
+  .tabs { display: flex; border-bottom: 1px solid var(--rule); }
+  .tabs button {
+    flex: 1; padding: 9px 0; font: inherit; font-size: 11.5px; cursor: pointer;
+    border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted);
+  }
+  .tabs button[aria-pressed="true"] {
+    color: var(--sign-blue); border-bottom-color: var(--sign-blue); font-weight: 700;
+  }
+  .tabs button:focus-visible { outline: 2px solid var(--sign-blue); outline-offset: -2px; }
+  #paneRoutes, #paneRecords { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #paneRoutes[hidden], #paneRecords[hidden], .tabs[hidden] { display: none; }
+  #paneRecords { overflow-y: auto; padding: 4px 0 24px; }
+
+  .rec { padding: 8px 16px; border-bottom: 1px solid #eef1f4; font-size: 11.5px; }
+  .rec.on { background: #fff6e2; }
+  .rec .head {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 0; border: 0; background: none; font: inherit; text-align: left; cursor: pointer;
+  }
+  .rec .head:hover .sec { text-decoration: underline; }
+  .rec .head:focus-visible { outline: 2px solid var(--sign-blue); outline-offset: 2px; }
+  .rec .num {
+    flex: none; min-width: 34px; padding: 1px 5px; border-radius: 4px; text-align: center;
+    background: var(--sign-blue); color: #fff; font-weight: 700; font-size: 10.5px;
+  }
+  .rec.on .num { background: #a86400; }
+  .rec .sec { flex: 1; min-width: 0; word-break: break-all; }
+  .rec .foot { display: flex; align-items: center; gap: 6px; margin-top: 5px; color: var(--muted); }
+  .rec .foot .when { flex: 1; font-variant-numeric: tabular-nums; }
+  .rec input {
+    font: inherit; font-size: 11px; padding: 3px 5px; width: 100%;
+    border: 1px solid var(--rule); border-radius: 4px; background: #fff; color: var(--ink);
+  }
+  .rec .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 5px; }
+  .btn.warn { border-color: var(--done); color: var(--done); }
 
   #list { flex: 1; overflow-y: auto; padding: 6px 0 24px; }
   .row {
@@ -1980,8 +2215,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="map"></div>
   <aside id="side">
     <header>
-      <h1>国道走破マップ</h1>
-      <p class="tagline">走った道を赤で塗る</p>
+      <div class="titlebar">
+        <div>
+          <h1>国道走破マップ</h1>
+          <p class="tagline">走った道を赤で塗る</p>
+        </div>
+        <button id="quit" type="button" hidden>終了</button>
+      </div>
     </header>
     <div class="stats">
       <div class="bar"><span id="bar"></span></div>
@@ -2014,13 +2254,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </label>
     </div>
     <div id="edit"></div>
-    <div class="filters">
-      <button data-filter="all" aria-pressed="true">すべて</button>
-      <button data-filter="done" aria-pressed="false">走破済み</button>
-      <button data-filter="partial" aria-pressed="false">一部</button>
-      <button data-filter="todo" aria-pressed="false">未走破</button>
+    <div class="tabs" id="tabs" hidden>
+      <button data-tab="routes" aria-pressed="true">路線</button>
+      <button data-tab="records" aria-pressed="false">走破記録</button>
     </div>
-    <div id="list"></div>
+    <div id="paneRoutes">
+      <div class="filters">
+        <button data-filter="all" aria-pressed="true">すべて</button>
+        <button data-filter="done" aria-pressed="false">走破済み</button>
+        <button data-filter="partial" aria-pressed="false">一部</button>
+        <button data-filter="todo" aria-pressed="false">未走破</button>
+      </div>
+      <div id="list"></div>
+    </div>
+    <div id="paneRecords" hidden></div>
     <div class="legend">
       <div><i style="background:var(--done)"></i>走破済み</div>
       <div><i style="background:var(--todo)"></i>未走破</div>
@@ -2099,6 +2346,7 @@ map.createPane("selPane").style.zIndex = 405;
 
 const COLORS = CONFIG.colors;
 let selectedRef = null;
+let recHighlight = null;   // 記録タブで選んだ区間の形（縁取りに使う）
 
 // 編集用の状態。道の駅レイヤがこれらを使うので、必ずレイヤ生成より前に置くこと。
 const EDITABLE = !!CONFIG.editable;
@@ -2142,7 +2390,10 @@ const layerDone = L.geoJSON(null, {
 // 選択を地図と一覧の両方に反映する
 function refreshSelection() {
   layerSel.clearLayers();
-  if (selectedRef) {
+  if (recHighlight) {
+    // 記録1件ぶんの区間だけを縁取る
+    for (const f of recHighlight) layerSel.addData(f);
+  } else if (selectedRef) {
     for (const f of GEOJSON.features) {
       if (f.properties.ref !== selectedRef) continue;
       // 未走破を隠しているときは、その部分の縁取りも出さない
@@ -2159,6 +2410,8 @@ function refreshSelection() {
 
 // 同じ番号をもう一度押すと解除
 function selectRoute(ref) {
+  recActive = null;          // 路線を選び直したら区間のハイライトは外す
+  recHighlight = null;
   selectedRef = (selectedRef === ref) ? null : ref;
   refreshSelection();
   return selectedRef !== null;
@@ -2617,6 +2870,7 @@ async function finishSection(ref, label, text) {
   try {
     const out = await post("/api/section", { ref: ref, section: section, date: today() });
     applyRouteUpdate(ref, out);
+    if (!recordsEl.hidden) loadRecords();
     showEdit(`国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b> を追加しました`
       + `（${out.summary.doneKm.toLocaleString()} / ${out.summary.km.toLocaleString()} km）`
       + `<br><button class="btn" data-cancel="1">閉じる</button>`);
@@ -2652,7 +2906,10 @@ function applyRouteUpdate(ref, out) {
 document.addEventListener("click", (ev) => {
   const btn = ev.target.closest("button[data-eki], button[data-start], " +
                                "button[data-finish], button[data-cancel], " +
-                               "button[data-pt-start], button[data-pt-finish]");
+                               "button[data-pt-start], button[data-pt-finish], " +
+                               "button[data-tab], button[data-rec-go], " +
+                               "button[data-rec-edit], button[data-rec-del], " +
+                               "button[data-rec-save], button[data-rec-cancel]");
   if (!btn) return;
   ev.preventDefault();
   const fail = (err) =>
@@ -2662,6 +2919,13 @@ document.addEventListener("click", (ev) => {
   if (btn.hasAttribute("data-cancel")) {
     pending = null;
     showEdit("");
+    if (recActive !== null) {
+      recActive = null;
+      recHighlight = null;
+      selectedRef = null;
+      refreshSelection();
+      renderRecords();
+    }
   } else if (btn.hasAttribute("data-eki")) {
     toggleEki(Number(btn.dataset.eki)).catch(fail);
   } else if (btn.hasAttribute("data-start") || btn.hasAttribute("data-finish")) {
@@ -2677,6 +2941,20 @@ document.addEventListener("click", (ev) => {
       : `${canon}@${pair[1]}`;
     if (btn.hasAttribute("data-start")) startSection(ref, popupNode[2], text);
     else finishSection(ref, popupNode[2], text).catch(fail);
+  } else if (btn.hasAttribute("data-tab")) {
+    showTab(btn.dataset.tab);
+  } else if (btn.hasAttribute("data-rec-go")) {
+    showRecord(Number(btn.dataset.recGo)).catch(fail);
+  } else if (btn.hasAttribute("data-rec-edit")) {
+    editingIndex = Number(btn.dataset.recEdit);
+    renderRecords();
+  } else if (btn.hasAttribute("data-rec-cancel")) {
+    editingIndex = null;
+    renderRecords();
+  } else if (btn.hasAttribute("data-rec-save")) {
+    saveRecord(Number(btn.dataset.recSave)).catch(fail);
+  } else if (btn.hasAttribute("data-rec-del")) {
+    deleteRecord(Number(btn.dataset.recDel)).catch(fail);
   } else if (btn.hasAttribute("data-pt-start") || btn.hasAttribute("data-pt-finish")) {
     if (!lineLatLng) return;
     const ref = btn.dataset.ptStart || btn.dataset.ptFinish;
@@ -2687,6 +2965,129 @@ document.addEventListener("click", (ev) => {
     else finishSection(ref, label, text).catch(fail);
   }
 });
+
+// ---- 走破記録の一覧（serve のときだけ） ----
+// CSV を開かずに日付の書き換えと削除ができるようにする。
+const recordsEl = document.getElementById("paneRecords");
+const routesEl = document.getElementById("paneRoutes");
+const tabsEl = document.getElementById("tabs");
+let RECORDS = [];
+let editingIndex = null;
+let recActive = null;      // ハイライト中の記録の番号
+
+function showTab(name) {
+  routesEl.hidden = name !== "routes";
+  recordsEl.hidden = name !== "records";
+  for (const b of tabsEl.querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.tab === name));
+  }
+  if (name === "records") loadRecords();
+}
+
+async function loadRecords() {
+  recordsEl.innerHTML = '<p style="padding:16px;font-size:12px;color:#6c7a89">読み込み中…</p>';
+  try {
+    const res = await fetch("/api/records");
+    RECORDS = (await res.json()).rows || [];
+  } catch (err) {
+    recordsEl.innerHTML = '<p style="padding:16px;font-size:12px;color:#d81f26">'
+      + "記録を読めませんでした</p>";
+    return;
+  }
+  renderRecords();
+}
+
+function renderRecords() {
+  if (!RECORDS.length) {
+    recordsEl.innerHTML = '<p style="padding:16px;font-size:12px;color:#6c7a89">'
+      + "まだ記録がありません。地図から区間を追加してください。</p>";
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const r of RECORDS) {
+    const div = document.createElement("div");
+    div.className = "rec" + (recActive === r.index ? " on" : "");
+    const editing = editingIndex === r.index;
+    let html =
+      `<button class="head" type="button" data-rec-go="${r.index}"`
+      + ` aria-pressed="${String(recActive === r.index)}">`
+      + `<span class="num">${esc(r.ref)}</span>`
+      + `<span class="sec">${esc(r.section)}</span></button>`;
+    if (editing) {
+      html += `<div class="grid">`
+        + `<input data-rec-date="${r.index}" value="${esc(r.date)}" placeholder="走破日">`
+        + `<input data-rec-note="${r.index}" value="${esc(r.note)}" placeholder="メモ">`
+        + `</div><div class="foot">`
+        + `<span class="when"></span>`
+        + `<button class="btn go" data-rec-save="${r.index}">保存</button>`
+        + `<button class="btn" data-rec-cancel="1">やめる</button></div>`;
+    } else {
+      html += `<div class="foot"><span class="when">`
+        + (r.date ? esc(r.date) : "日付なし")
+        + (r.note ? "　" + esc(r.note) : "")
+        + `</span>`
+        + `<button class="btn" data-rec-edit="${r.index}">編集</button>`
+        + `<button class="btn warn" data-rec-del="${r.index}">削除</button></div>`;
+    }
+    div.innerHTML = html;
+    frag.appendChild(div);
+  }
+  recordsEl.innerHTML = "";
+  recordsEl.appendChild(frag);
+}
+
+function applyRecordResult(out) {
+  RECORDS = out.rows || RECORDS;
+  editingIndex = null;
+  // 行が動くと番号がずれるので、ハイライトは落とす
+  recActive = null;
+  recHighlight = null;
+  if (out.summary && out.features) applyRouteUpdate(out.summary.ref, out);
+  else if (out.stats) refreshStats(out.stats);
+  renderRecords();
+}
+
+// 記録1件が指している区間だけを地図に浮かび上がらせる
+async function showRecord(index) {
+  const row = RECORDS.find(r => r.index === index);
+  if (!row) return;
+  if (recActive === index) {          // もう一度押したら解除
+    recActive = null;
+    recHighlight = null;
+    selectedRef = null;
+    refreshSelection();
+    renderRecords();
+    return;
+  }
+  const out = await post("/api/preview", { index: index, section: row.section });
+  recActive = index;
+  recHighlight = out.features;
+  selectedRef = out.ref;              // その路線以外を沈める
+  refreshSelection();
+  renderRecords();
+  map.fitBounds(out.bounds, { padding: [50, 50] });
+  showEdit(`国道${out.ref}号 <b>${esc(row.section)}</b>（${out.km.toLocaleString()} km）`
+    + `<br><button class="btn" data-cancel="1">閉じる</button>`);
+}
+
+async function saveRecord(index) {
+  const row = RECORDS.find(r => r.index === index);
+  if (!row) return;
+  const date = recordsEl.querySelector(`[data-rec-date="${index}"]`).value;
+  const note = recordsEl.querySelector(`[data-rec-note="${index}"]`).value;
+  applyRecordResult(await post("/api/record", {
+    action: "update", index: index, section: row.section, date: date, note: note
+  }));
+}
+
+async function deleteRecord(index) {
+  const row = RECORDS.find(r => r.index === index);
+  if (!row) return;
+  if (!confirm(`国道${row.ref}号「${row.section}」を削除します。よろしいですか。`)) return;
+  applyRecordResult(await post("/api/record", {
+    action: "delete", index: index, section: row.section
+  }));
+}
 
 // ---- 表示設定 ----
 const basemapEl = document.getElementById("basemap");
@@ -2733,6 +3134,46 @@ showNodesEl.addEventListener("change", () => {
 });
 showEkiEl.addEventListener("change", stackLayers);
 
+// ---- 起動と終了（serve のときだけ） ----
+// プログラム本体はこの画面が生きている間だけ動く。
+// タブを閉じたら本体も終わるようにしておかないと、
+// 使う人が「黒い画面」を自分で閉じる羽目になる。
+const quitEl = document.getElementById("quit");
+quitEl.hidden = !EDITABLE;
+
+function farewell(text) {
+  const box = document.createElement("div");
+  box.id = "bye";
+  box.innerHTML = `<div><b>終了しました</b><span>${esc(text)}</span></div>`;
+  document.body.appendChild(box);
+}
+
+if (EDITABLE) {
+  // 生きている合図。これが途絶えると本体は自分で終わる
+  const beat = () => fetch("/api/ping", { method: "POST" }).catch(() => {});
+  beat();
+  setInterval(beat, __PING_MS__);
+  // 別のページから戻ってきたとき（bfcache）にも、すぐ知らせる
+  window.addEventListener("pageshow", beat);
+
+  // タブを閉じたとき。読み込み直しでも飛ぶので、本体は少し待ってから判断する
+  window.addEventListener("pagehide", () => {
+    if (navigator.sendBeacon) navigator.sendBeacon("/api/bye", "{}");
+  });
+
+  quitEl.addEventListener("click", async () => {
+    quitEl.disabled = true;
+    try {
+      await fetch("/api/quit", { method: "POST" });
+    } catch (err) {
+      /* 本体が先に落ちていても構わない */
+    }
+    farewell("このタブを閉じてください。"
+      + "もう一度使うときは、プログラムをもう一度起動してください。");
+  });
+}
+
+tabsEl.hidden = !EDITABLE;
 setBasemap(basemapEl.value);
 stackLayers();
 drawLabels();
