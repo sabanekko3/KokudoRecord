@@ -2271,7 +2271,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="legend">
       <div><i style="background:var(--done)"></i>走破済み</div>
       <div><i style="background:var(--todo)"></i>未走破</div>
-      <div><b style="color:var(--done)">●</b> 訪問済みの道の駅　<b style="color:var(--todo)">●</b> 未訪問</div>
+      <div><b style="color:var(--done)">★</b> 訪問済みの道の駅　<b style="color:var(--todo)">★</b> 未訪問</div>
       <div style="margin-top:6px"><b style="color:#0b3f8f">●</b> 信号交差点　<b style="color:#0f7b4f">◆</b> 国道どうしの交点　<b style="color:#111827">◆</b> 路線の端</div>
       <div style="margin-top:6px">一覧の番号を押すとその国道だけが色濃く出ます（もう一度押すと解除）</div>
       <div>交差点名をクリックすると区間欄用の書き方が出ます</div>
@@ -2517,14 +2517,37 @@ for (const layer of [layerDone, layerTodo]) {
 
 // ---- 道の駅 ----
 // 千駅ほどなので、交差点名と違って普通のマーカーで足りる。
+// ただし交差点の丸と紛らわしいので、星形にして一目で見分けられるようにする。
+// 描き方だけを差し替え、当たり判定は CircleMarker のまま（半径で丸く判定される）。
+const StarMarker = L.CircleMarker.extend({
+  _updatePath: function () {
+    const r = this._renderer;
+    if (!r._ctx) {                   // 万一 SVG で描くときは丸のまま
+      L.CircleMarker.prototype._updatePath.call(this);
+      return;
+    }
+    if (!r._drawing || this._empty()) return;
+    const ctx = r._ctx, p = this._point, rad = Math.max(this._radius, 1);
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const ang = -Math.PI / 2 + i * Math.PI / 5;
+      const rr = (i % 2) ? rad * 0.45 : rad;      // 外角と内角を交互に
+      const x = p.x + Math.cos(ang) * rr, y = p.y + Math.sin(ang) * rr;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    r._fillStroke(ctx, this);
+  }
+});
+
 const layerEki = L.layerGroup([], { pane: "featPane" });
 
 EKI.forEach((e, i) => {
   const been = e[4];
-  const marker = L.circleMarker([e[0], e[1]], {
-    pane: "featPane", renderer: featRenderer, radius: been ? 6 : 5,
-    color: "#fff", weight: 1.6, opacity: 0.95,
-    fillColor: been ? COLORS.done : COLORS.todo, fillOpacity: been ? 1 : 0.8
+  const marker = new StarMarker([e[0], e[1]], {
+    pane: "featPane", renderer: featRenderer, radius: been ? 8 : 7,
+    color: "#fff", weight: 1.6, opacity: 0.95, lineJoin: "round",
+    fillColor: been ? COLORS.done : COLORS.todo, fillOpacity: been ? 1 : 0.85
   }).addTo(layerEki);
   marker.bindPopup(() => ekiPopup(i));
   ekiMarkers[i] = marker;
@@ -2845,7 +2868,7 @@ async function toggleEki(i) {
   e[5] = date;
   marker.setStyle({
     fillColor: e[4] ? COLORS.done : COLORS.todo,
-    fillOpacity: e[4] ? 1 : 0.8, radius: e[4] ? 6 : 5
+    fillOpacity: e[4] ? 1 : 0.85, radius: e[4] ? 8 : 7
   });
   marker.setPopupContent(ekiPopup(i));
   refreshStats(out.stats);
