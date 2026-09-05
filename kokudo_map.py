@@ -20,6 +20,8 @@
     python kokudo_map.py fetch --all     全国道 (1〜507号) の形状を取得（初回のみ）
     python kokudo_map.py nodes 17        国道17号で使える交差点名の一覧を出す
     python kokudo_map.py build           閲覧用の静的な地図を生成
+    python kokudo_map.py reset           キャッシュの中身を見る（何も消さない）
+    python kokudo_map.py reset --derived 導出データだけ消す（すぐ作り直せる）
 
 依存ライブラリなし（標準ライブラリのみ）。
 """
@@ -1764,6 +1766,165 @@ def total_length_km(refs, jsig, quiet=False, known=None):
     total = sum(all_edges.values())
     save_pickle(TOTAL_PATH, {"sig": sig, "km": total})
     return total
+
+
+# --------------------------------------------------------------------------
+# reset（キャッシュを見る・消す）
+# --------------------------------------------------------------------------
+#
+# 取り直しに時間がかかるもの（Overpass から取ったもの）と、いつでも作り直せるもの
+# （形状から導いたもの）を、はっきり分けて扱う。前者を消すときは必ず確認を取る。
+
+
+def walk_files(path):
+    out = []
+    for root, _dirs, names in os.walk(path):
+        out.extend(os.path.join(root, n) for n in names)
+    return out
+
+
+def total_size(paths):
+    return sum(os.path.getsize(p) for p in paths if os.path.exists(p))
+
+
+def human_size(n):
+    for unit, step in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= step:
+            return f"{n / step:.1f} {unit}"
+    return f"{n} B"
+
+
+def cached_refs():
+    """形状を持っている路線番号"""
+    if not os.path.isdir(CACHE_DIR):
+        return []
+    refs = [n[1:-5] for n in os.listdir(CACHE_DIR)
+            if re.fullmatch(r"r\d+\.json", n)]
+    return sorted(refs, key=int)
+
+
+def route_files(ref):
+    """その路線に属するファイルすべて（形状・交差点名・区間・導出）"""
+    out = [route_cache_path(ref), node_cache_path(ref),
+           os.path.join(DERIVED_DIR, f"r{ref}.pkl"),
+           os.path.join(DERIVED_DIR, f"r{ref}.graph.pkl")]
+    if os.path.isdir(AREA_DIR):
+        out += [os.path.join(AREA_DIR, n) for n in os.listdir(AREA_DIR)
+                if re.fullmatch(rf"r{ref}@.*\.json", n)]
+    return [f for f in out if os.path.exists(f)]
+
+
+def cache_parts():
+    """消す単位ごとの (名前, 説明, ファイル一覧, 取り直しが要るか)"""
+    shapes, nodes = [], []
+    for ref in cached_refs():
+        shapes.append(route_cache_path(ref))
+        if os.path.exists(node_cache_path(ref)):
+            nodes.append(node_cache_path(ref))
+    return [
+        ("導出データ", "形状から導いたもの。消しても次の起動で作り直される",
+         walk_files(DERIVED_DIR) + [JUNCTION_PATH], False),
+        ("路線の形状", "Overpass から取った国道の線。取り直しに数十分",
+         shapes, True),
+        ("交差点名", "路線上の名前付きノード。取り直しに十数時間",
+         nodes, True),
+        ("区間の形状", "都道府県・市町村で切った部分",
+         walk_files(AREA_DIR), True),
+        ("道の駅", "都道府県ごとの道の駅。取り直しに1時間ほど",
+         walk_files(EKI_DIR), True),
+    ]
+
+
+def show_cache():
+    parts = cache_parts()
+    print(f"{CACHE_DIR}\n")
+    print(f"  {'内容':<12}{'ファイル':>8}{'大きさ':>12}   取り直し")
+    print("  " + "-" * 60)
+    for name, _desc, files, refetch in parts:
+        files = [f for f in files if os.path.exists(f)]
+        print(f"  {name:<12}{len(files):>8}{human_size(total_size(files)):>12}"
+              f"   {'要（時間がかかる）' if refetch else '不要（すぐ作り直せる）'}")
+    everything = [f for f in walk_files(CACHE_DIR)]
+    print("  " + "-" * 60)
+    print(f"  {'合計':<12}{len(everything):>8}{human_size(total_size(everything)):>12}")
+
+
+def remove_files(files):
+    """消して、消した数と大きさを返す"""
+    files = [f for f in files if os.path.exists(f)]
+    size = total_size(files)
+    for f in files:
+        os.remove(f)
+    # 空になった入れものを片付ける
+    for d in (DERIVED_DIR, AREA_DIR, NODE_DIR, EKI_DIR):
+        if os.path.isdir(d) and not os.listdir(d):
+            os.rmdir(d)
+    return len(files), size
+
+
+def confirm(text, assume_yes):
+    if assume_yes:
+        return True
+    try:
+        return input(f"{text} 消してよければ yes と入力してください: ").strip().lower() == "yes"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def cmd_reset(args):
+    if not os.path.isdir(CACHE_DIR):
+        print(f"{CACHE_DIR} がありません。")
+        return
+
+    # 何も指定が無ければ、中身を見せるだけ
+    if not (args.derived or args.eki or args.all or args.refs):
+        show_cache()
+        print("\n消すときは次のように指定してください。")
+        print("  python kokudo_map.py reset --derived   導出データだけ（すぐ作り直せる）")
+        print("  python kokudo_map.py reset 17 290      指定した路線ぶん")
+        print("  python kokudo_map.py reset --eki       道の駅")
+        print("  python kokudo_map.py reset --all       cache/ を丸ごと")
+        return
+
+    if args.all:
+        files = walk_files(CACHE_DIR)
+        label = "cache/ の中身すべて"
+        heavy = True
+    elif args.refs:
+        bad = [r for r in args.refs if not r.isdigit()]
+        if bad:
+            print(f"路線番号として読めません: {'、'.join(bad)}", file=sys.stderr)
+            sys.exit(1)
+        files = [f for r in args.refs for f in route_files(r)]
+        label = "国道" + "号・国道".join(args.refs) + "号ぶん"
+        heavy = True
+    elif args.eki:
+        files = walk_files(EKI_DIR)
+        label = "道の駅"
+        heavy = True
+    else:
+        files = walk_files(DERIVED_DIR) + [JUNCTION_PATH]
+        label = "導出データ"
+        heavy = False
+
+    files = [f for f in files if os.path.exists(f)]
+    if not files:
+        print(f"{label}: 消すものがありません。")
+        return
+
+    print(f"{label}: {len(files)} ファイル / {human_size(total_size(files))}")
+    if heavy:
+        print("**これは Overpass から取り直しになります。時間がかかります。**")
+        if not confirm(f"{label}を消します。", args.yes):
+            print("やめました。")
+            return
+    n, size = remove_files(files)
+    print(f"{n} ファイル（{human_size(size)}）を消しました。")
+    if heavy:
+        print("`python kokudo_map.py fetch --all` で取り直してください。")
+    else:
+        print("次の起動で自動的に作り直されます。")
 
 
 # --------------------------------------------------------------------------
@@ -3693,6 +3854,15 @@ def main():
 
     p = sub.add_parser("build", help="地図 HTML を生成する")
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("reset", help="キャッシュの中身を見る・消す")
+    p.add_argument("refs", nargs="*", help="消す路線番号（例: 17 290）")
+    p.add_argument("--derived", action="store_true",
+                   help="導出データだけ消す（すぐ作り直せる）")
+    p.add_argument("--eki", action="store_true", help="道の駅を消す")
+    p.add_argument("--all", action="store_true", help="cache/ を丸ごと消す")
+    p.add_argument("--yes", action="store_true", help="確認せずに消す")
+    p.set_defaults(func=cmd_reset)
 
     p = sub.add_parser("serve", help="地図から履歴を編集できる状態で開く（引数なしと同じ）")
     p.add_argument("--port", type=int, default=SERVE_PORT, help=f"既定 {SERVE_PORT}")

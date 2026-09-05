@@ -1,4 +1,6 @@
-cache/
+# 取り直しに時間がかかるので cache/ は git に入れる。
+# ただし導出データ（165MB・pickle）はいつでも作り直せるので除く。
+cache/derived/
 kokudo_map.html
 交差点一覧/
 __pycache__/
