@@ -25,13 +25,18 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
+import functools
+import gc
+import hashlib
 import heapq
 import http.server
 import io
 import json
 import math
 import os
+import pickle
 import random
 import re
 import sys
@@ -53,6 +58,10 @@ AREA_DIR = os.path.join(CACHE_DIR, "area")
 NODE_DIR = os.path.join(CACHE_DIR, "nodes")
 LIST_DIR = os.path.join(BASE_DIR, "交差点一覧")
 JUNCTION_PATH = os.path.join(CACHE_DIR, "junctions.json")
+# 形状から導いたもの（グラフ・キロ程・地点一覧・間引いた線）の置き場。
+# cache/ の中身だけから作れるので、消しても次の build で作り直される。
+DERIVED_DIR = os.path.join(CACHE_DIR, "derived")
+TOTAL_PATH = os.path.join(DERIVED_DIR, "total.pkl")
 EKI_DIR = os.path.join(CACHE_DIR, "michinoeki")
 CSV_PATH = os.path.join(BASE_DIR, "routes.csv")
 EKI_CSV_PATH = os.path.join(BASE_DIR, "michinoeki.csv")
@@ -112,6 +121,10 @@ NODE_MIN_ZOOM = 11
 LABEL_MIN_ZOOM = 13
 # 座標を突き合わせるときの丸め桁数。OSMの座標精度に合わせる。
 COORD_PRECISION = 7
+# 導出データの形式番号。導出の計算方法を変えたら上げる（古いものを作り直させる）
+DERIVED_VERSION = 1
+# 導出を何プロセスで走らせるか。None なら CPU の数
+DERIVE_WORKERS = None
 # グラフ上の隙間をどこまで繋ぐか [m]。OSM で隣り合う way の端点が数mずれたまま
 # 接続されておらず、路線が分断されて見えることがある（国道158号 飛騨清見IC付近など）。
 GAP_BRIDGE_M = 50.0
@@ -163,9 +176,35 @@ def seg_km(p, q):
     return haversine_km(p[1], p[0], q[1], q[0])
 
 
+# ノードのキーは座標を 1e-7 度単位の整数にして1つの int に詰めたもの。
+#   (経度+180)*1e7 を上位32ビット、(緯度+90)*1e7 を下位32ビット
+# 同じ OSM ノードは必ず同じ座標を返すので、これだけでグラフを組める。
+# タプルより辞書・集合の操作が速く、pickle も小さい。
+# 上位が経度なので、キーの大小は (経度, 緯度) の辞書順と一致する。
+KEY_SCALE = 10 ** COORD_PRECISION
+KEY_MASK = (1 << 32) - 1
+
+
 def node_key(p):
-    """座標を突き合わせ用のキーにする。同じOSMノードなら必ず一致する。"""
-    return (round(p[0], COORD_PRECISION), round(p[1], COORD_PRECISION))
+    """[lon, lat] を突き合わせ用のキー（int）にする。"""
+    return (round((p[0] + 180.0) * KEY_SCALE) << 32) | round((p[1] + 90.0) * KEY_SCALE)
+
+
+def key_lonlat(key):
+    """node_key を (lon, lat) に戻す。
+
+    割り算の誤差で 138.80871229999999 のようになるのを、7桁に丸めて
+    OSM の値そのもの（JSON から読んだ float）に揃える。
+    """
+    return (round((key >> 32) / KEY_SCALE - 180.0, COORD_PRECISION),
+            round((key & KEY_MASK) / KEY_SCALE - 90.0, COORD_PRECISION))
+
+
+def key_dist_km(a, b):
+    """2つのキーの間の距離 [km]"""
+    lon1, lat1 = key_lonlat(a)
+    lon2, lat2 = key_lonlat(b)
+    return haversine_km(lat1, lon1, lat2, lon2)
 
 
 def edge_key(a, b):
@@ -173,38 +212,44 @@ def edge_key(a, b):
     return (a, b) if a <= b else (b, a)
 
 
-def simplify(coords, tol):
-    """Douglas-Peucker による間引き。coords は [[lon, lat], ...]"""
-    if len(coords) < 3:
-        return coords
+def simplify_mask(coords, tol):
+    """Douglas-Peucker で残す点を選ぶ。coords は [[lon, lat], ...]。
+
+    残す点を 1 にした bytes を返す（両端は必ず 1）。
+    走破／未走破で線を切るときも同じ印を使えば、切り方が変わっても形が揺れない。
+    """
+    n = len(coords)
+    if n < 3:
+        return bytes([1]) * n
     scale = math.cos(math.radians(coords[0][1])) or 1.0
+    hypot = math.hypot
 
-    def perp(p, a, b):
-        px, py = (p[0] - a[0]) * scale, p[1] - a[1]
-        bx, by = (b[0] - a[0]) * scale, b[1] - a[1]
-        d2 = bx * bx + by * by
-        if d2 == 0:
-            return math.hypot(px, py)
-        t = max(0.0, min(1.0, (px * bx + py * by) / d2))
-        return math.hypot(px - t * bx, py - t * by)
-
-    keep = [False] * len(coords)
-    keep[0] = keep[-1] = True
-    stack = [(0, len(coords) - 1)]
+    keep = bytearray(n)
+    keep[0] = keep[-1] = 1
+    stack = [(0, n - 1)]
     while stack:
         s, e = stack.pop()
         if e <= s + 1:
             continue
+        ax, ay = coords[s]
+        bx, by = (coords[e][0] - ax) * scale, coords[e][1] - ay
+        d2 = bx * bx + by * by
         far_i, far_d = -1, 0.0
         for i in range(s + 1, e):
-            d = perp(coords[i], coords[s], coords[e])
+            px, py = (coords[i][0] - ax) * scale, coords[i][1] - ay
+            if d2 == 0:
+                d = hypot(px, py)
+            else:
+                t = (px * bx + py * by) / d2
+                t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+                d = hypot(px - t * bx, py - t * by)
             if d > far_d:
                 far_i, far_d = i, d
         if far_d > tol:
-            keep[far_i] = True
+            keep[far_i] = 1
             stack.append((s, far_i))
             stack.append((far_i, e))
-    return [c for c, k in zip(coords, keep) if k]
+    return bytes(keep)
 
 
 # --------------------------------------------------------------------------
@@ -513,6 +558,45 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False)
 
 
+def without_gc(fn):
+    """実行中だけ循環 GC を止める。
+
+    数百万個の小さなオブジェクト（座標・辺・キロ程）を一度に作る処理では、
+    世代別 GC が何度も全体を走査して数倍遅くなる（実測で pickle の読み込みが
+    3.4秒→1.1秒）。ここで作るものに循環参照は無いので、参照カウントだけで足りる。
+    """
+    # functools.wraps で __qualname__ も写す。これが無いと別プロセスへ関数を
+    # 渡せず（pickle が名前で引けない）、並列の導出が動かない
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if was_enabled:
+                gc.enable()
+    return wrapper
+
+
+def load_pickle(path):
+    """導出データを読む。無い・壊れている・形式が古いときは None（作り直させる）"""
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError):
+        return None
+
+
+def save_pickle(path, data):
+    """途中で止まっても半端なファイルを残さないよう、別名で書いてから置き換える"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
 def fetch_route(ref, force=False):
     """路線全体の形状"""
     path = route_cache_path(ref)
@@ -765,14 +849,9 @@ def build_eki():
 # さらに区間欄には `@緯度,経度` と直接書ける（`nearest()` で吸着させる）。
 
 
-def _pack(key):
-    """node_key を1つの整数にする。交点の集計で辞書を軽くするため。"""
-    return int(round(key[0] * 1e7)) * (1 << 32) + int(round(key[1] * 1e7))
-
-
 def cache_signature(refs):
     """路線キャッシュが変わったかを見る印"""
-    sig = []
+    sig = [f"v{DERIVED_VERSION}"]
     for ref in refs:
         path = route_cache_path(ref)
         if os.path.exists(path):
@@ -780,24 +859,27 @@ def cache_signature(refs):
     return "|".join(sig)
 
 
+@without_gc
 def build_junction_index(refs, quiet=False):
-    """国道どうしの交点を求める。{packされた座標: (路線番号, ...)}
+    """国道どうしの交点を求める。({node_key: (路線番号, ...)}, 印) を返す。
 
     2本以上が通るノードのうち、隣のノードと路線の組み合わせが変わる境目だけを
     採る。こうしないと重複区間の途中が丸ごと交点になってしまう。
+    印は導出データの鮮度確認にも使う（交点が変われば地点一覧も変わる）。
     """
     cached = load_json(JUNCTION_PATH)
     sig = cache_signature(refs)
     if cached and cached.get("signature") == sig:
-        return {int(k): tuple(v) for k, v in cached["junctions"].items()}
+        return {int(k): tuple(v) for k, v in cached["junctions"].items()}, sig
 
     if not quiet:
-        print("  国道どうしの交点を算出しています…（初回のみ）", file=sys.stderr)
+        print("  国道どうしの交点を算出しています…（キャッシュが変わったときだけ）",
+              file=sys.stderr)
 
     seen = defaultdict(int)
     for ref in refs:
         ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
-        nodes = {_pack(node_key(c)) for coords in ways.values() for c in coords}
+        nodes = {node_key(c) for coords in ways.values() for c in coords}
         for n in nodes:
             seen[n] += 1
     shared = {n for n, c in seen.items() if c >= 2}
@@ -810,7 +892,7 @@ def build_junction_index(refs, quiet=False):
         for coords in ways.values():
             prev = None
             for c in coords:
-                n = _pack(node_key(c))
+                n = node_key(c)
                 if n in shared:
                     node_refs[n].append(ref)
                 if prev is not None and (prev in shared or n in shared):
@@ -826,42 +908,48 @@ def build_junction_index(refs, quiet=False):
                               "junctions": {str(k): list(v) for k, v in junctions.items()}})
     if not quiet:
         print(f"  国道どうしの交点 {len(junctions):,} 箇所", file=sys.stderr)
-    return junctions
+    return junctions, sig
 
 
 def derived_nodes(ref, graph, node_dist, junctions):
     """その路線で使える、こちらで算出した地点"""
     out = []
 
-    # 交差点の分岐は数m刻みで何点も立つことがあるので、同名で近いものはまとめる
+    # 交差点の分岐は数m刻みで何点も立つことがあるので、同名で近いものはまとめる。
+    # 交点は全国で数千なので、路線の全ノードではなく交点の側を走査する
+    # （並びはキー順＝(経度, 緯度) 順で、以前と同じ）。
     found = []
-    for key in sorted(graph.adj):
-        rs = junctions.get(_pack(key))
-        if not rs or ref not in rs:
+    adj = graph.adj
+    for key in sorted(junctions):
+        rs = junctions[key]
+        if ref not in rs or key not in adj:
             continue
         name = "×".join(f"R{r}" for r in rs)
-        if any(n == name and haversine_km(key[1], key[0], la, lo) < CROSS_MERGE_KM
+        lon, lat = key_lonlat(key)
+        if any(n == name and haversine_km(lat, lon, la, lo) < CROSS_MERGE_KM
                for n, la, lo in found):
             continue
-        found.append((name, key[1], key[0]))
-        out.append({"name": name, "lat": key[1], "lon": key[0], "kind": KIND_CROSS})
+        found.append((name, lat, lon))
+        out.append({"name": name, "lat": lat, "lon": lon, "kind": KIND_CROSS})
 
-    ends = route_ends(graph, node_dist)
-    for key, label in ends:
-        out.append({"name": f"R{ref}端({label})", "lat": key[1], "lon": key[0],
+    for key, label in route_ends(node_dist):
+        lon, lat = key_lonlat(key)
+        out.append({"name": f"R{ref}端({label})", "lat": lat, "lon": lon,
                     "kind": KIND_END})
     return out
 
 
-def route_ends(graph, node_dist):
+def route_ends(node_dist):
     """路線の両端。向き（北/南/東/西）を付けて区別できるようにする。"""
     if not node_dist:
         return []
-    start = min(node_dist, key=lambda k: node_dist[k])
-    far = max(node_dist, key=lambda k: node_dist[k])
+    start = min(node_dist, key=node_dist.get)
+    far = max(node_dist, key=node_dist.get)
     if start == far:
         return []
-    dlat, dlon = far[1] - start[1], far[0] - start[0]
+    slon, slat = key_lonlat(start)
+    flon, flat = key_lonlat(far)
+    dlat, dlon = flat - slat, flon - slon
     if abs(dlat) >= abs(dlon):
         a, b = ("南", "北") if dlat > 0 else ("北", "南")
     else:
@@ -874,23 +962,55 @@ def route_ends(graph, node_dist):
 # --------------------------------------------------------------------------
 
 class RouteGraph:
-    """1路線の道路網。座標が一致するノードで繋がっているとみなす。"""
+    """1路線の道路網。座標が一致するノードで繋がっているとみなす。
 
-    def __init__(self, ways):
+    形状（ways）から組むときは辺の距離を測り、隙間も繋ぐ。
+    導出済みの辺（edges）から組み直すときはそのまま隣接表を作るだけ
+    （橋渡しした辺も edges に入っているので、やり直す必要がない）。
+    edges の並び順を保って足すので、どちらから組んでも隣接表の並びは同じになる。
+    """
+
+    def __init__(self, ways=None, edges=None):
         self.adj = defaultdict(list)
         self.edges = {}
-        for coords in ways.values():
+        self.way_keys = {}      # way ID → その way の各座標の node_key
+        self.bridged = 0
+        if ways is not None:
+            self._add_ways(ways)
+            self.bridged = self._bridge_gaps()
+        elif edges is not None:
+            self._add_edges(edges)
+
+    def _add_ways(self, ways):
+        edges, adj = self.edges, self.adj
+        radians, sin, cos, asin, sqrt = math.radians, math.sin, math.cos, math.asin, math.sqrt
+        for wid, coords in ways.items():
+            keys = [node_key(c) for c in coords]
+            self.way_keys[wid] = keys
             for i in range(len(coords) - 1):
-                a, b = node_key(coords[i]), node_key(coords[i + 1])
+                a, b = keys[i], keys[i + 1]
                 if a == b:
                     continue
-                key = edge_key(a, b)
-                if key not in self.edges:
-                    self.edges[key] = seg_km(coords[i], coords[i + 1])
-                    d = self.edges[key]
-                    self.adj[a].append((b, d, key))
-                    self.adj[b].append((a, d, key))
-        self.bridged = self._bridge_gaps()
+                key = (a, b) if a <= b else (b, a)
+                if key in edges:
+                    continue
+                # haversine_km() の展開。全国で170万回呼ぶので関数呼び出しを省く
+                p, q = coords[i], coords[i + 1]
+                p1, p2 = radians(p[1]), radians(q[1])
+                h = (sin((p2 - p1) / 2) ** 2
+                     + cos(p1) * cos(p2) * sin(radians(q[0] - p[0]) / 2) ** 2)
+                d = 12742.0 * asin(sqrt(h))
+                edges[key] = d
+                adj[a].append((b, d, key))
+                adj[b].append((a, d, key))
+
+    def _add_edges(self, edges):
+        self.edges = edges
+        adj = self.adj
+        for key, d in edges.items():
+            a, b = key
+            adj[a].append((b, d, key))
+            adj[b].append((a, d, key))
 
     def _bridge_gaps(self):
         """way が繋がっていないだけの隙間を埋める。2段階でやる。
@@ -928,21 +1048,22 @@ class RouteGraph:
         made = 0
 
         # -- 1段目: 行き止まり → 任意のノード -----------------------------
+        # 升目はキーの整数座標のまま切る（浮動小数に戻さない）
         limit = GAP_BRIDGE_M / 1000.0
-        cell = limit / 111.0 * 2
+        cell = int(limit / 111.0 * 2 * KEY_SCALE)
         grid = defaultdict(list)
         for k in self.adj:
-            grid[(int(k[1] / cell), int(k[0] / cell))].append(k)
+            grid[((k & KEY_MASK) // cell, (k >> 32) // cell)].append(k)
 
         for e in sorted(k for k, v in self.adj.items() if len(v) == 1):
-            gy, gx = int(e[1] / cell), int(e[0] / cell)
+            gy, gx = (e & KEY_MASK) // cell, (e >> 32) // cell
             best, best_d = None, limit
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     for k in grid.get((gy + dy, gx + dx), ()):
                         if find(k) == find(e):
                             continue
-                        d = haversine_km(e[1], e[0], k[1], k[0])
+                        d = key_dist_km(e, k)
                         if d < best_d:
                             best, best_d = k, d
             if best is not None:
@@ -958,7 +1079,7 @@ class RouteGraph:
                 for b in ends[i + 1:]:
                     if find(a) == find(b):
                         continue
-                    d = haversine_km(a[1], a[0], b[1], b[0])
+                    d = key_dist_km(a, b)
                     if d <= limit2:
                         pairs.append((d, a, b))
             for d, a, b in sorted(pairs):
@@ -976,9 +1097,12 @@ class RouteGraph:
         key = node_key([lon, lat])
         if key in self.adj:
             return key
+        # 一致しなければ線形探索。緯度方向を 1.2 倍して、おおむね等方にする
+        x0, y0 = key >> 32, key & KEY_MASK
         best, best_d = None, float("inf")
         for k in self.adj:
-            d = (k[0] - lon) ** 2 + ((k[1] - lat) * 1.2) ** 2
+            dx, dy = (k >> 32) - x0, ((k & KEY_MASK) - y0) * 1.2
+            d = dx * dx + dy * dy
             if d < best_d:
                 best, best_d = k, d
         return best
@@ -1047,7 +1171,15 @@ class RouteGraph:
         if ca is None or cb is None or ca is cb:
             return None
         small, large = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
-        return min(haversine_km(p[1], p[0], q[1], q[0]) for p in small for q in large)
+        large_pos = [key_lonlat(q) for q in large]
+        best = float("inf")
+        for p in small:
+            plon, plat = key_lonlat(p)
+            for qlon, qlat in large_pos:
+                d = haversine_km(plat, plon, qlat, qlon)
+                if d < best:
+                    best = d
+        return best
 
     def far_end(self):
         """路線の端らしいノードを1つ選ぶ（一覧を起点側から並べるのに使う）
@@ -1308,32 +1440,22 @@ def cmd_nodes(args):
         print("\n中断しました。", file=sys.stderr)
         return
 
-    ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
-    nodes = (load_json(node_cache_path(ref)) or {}).get("nodes") or []
-    if not ways:
+    # 地点の一覧は地図と同じ導出データ（route_points 相当）から出す
+    junctions, jsig = build_junction_index(sorted(cached_route_refs(), key=int))
+    route = load_route(ref, junctions, jsig)
+    if route is None:
         print(f"国道{ref}号の形状がありません。", file=sys.stderr)
         return
 
-
-    graph = RouteGraph(ways)
-    start = graph.far_end()
-    dist, _ = graph.dijkstra(start, [])
-
-    cached_refs = sorted((n[1:-5] for n in os.listdir(CACHE_DIR)
-                          if n.startswith("r") and n.endswith(".json")), key=int)
-    nodes = nodes + derived_nodes(ref, graph, dist, build_junction_index(cached_refs))
-
     labels = {KIND_SIGNAL: "信号", KIND_CROSS: "国道交点", KIND_END: "路線の端"}
     rows = []
-    for n in nodes:
-        k = graph.nearest(n["lon"], n["lat"])
-        kind = n.get("kind", KIND_SIGNAL if n.get("signals") else KIND_PLAIN)
+    for p in route.points:
         rows.append({
-            "名称": n["name"],
-            "起点からの距離km": round(dist.get(k, float("nan")), 1) if k in dist else "",
-            "信号交差点": labels.get(kind, ""),
-            "緯度": round(n["lat"], 6),
-            "経度": round(n["lon"], 6),
+            "名称": p["name"],
+            "起点からの距離km": p["km"] if p["km"] is not None else "",
+            "信号交差点": labels.get(p["kind"], ""),
+            "緯度": round(p["lat"], 6),
+            "経度": round(p["lon"], 6),
         })
     rows.sort(key=lambda r: (r["起点からの距離km"] == "", r["起点からの距離km"]))
 
@@ -1356,29 +1478,310 @@ def cmd_nodes(args):
 
 
 # --------------------------------------------------------------------------
+# 導出データ（cache/derived/）
+# --------------------------------------------------------------------------
+#
+# 形状 (cache/r*.json) からグラフ・キロ程・地点一覧・間引いた線を導く計算は
+# 全路線で1分近くかかるが、routes.csv には依存しない。そこで路線ごとに一度だけ
+# 計算して pickle に保存し、build / serve はそれを読むだけにする。
+#
+#   r{ref}.pkl        light … 地図に出すのに要る小さい方
+#                       km, bounds, lines（間引いた線）, points（地点と端からのkm）
+#   r{ref}.graph.pkl  heavy … 区間を辺に直すのに要る方
+#                       ways, keys（座標ごとの node_key）, keep（間引きで残す点）,
+#                       edges（辺→km。橋渡しした辺も含む）, node_dist
+#   total.pkl         全国の総延長（重複区間を除いた辺の和）
+#
+# 記録の無い路線は light しか読まない。記録のある路線（十数本）だけ heavy を読む。
+# 鮮度は route_signature() で見る。形状か交差点名のファイル、交点の印、
+# DERIVED_VERSION のどれかが変わっていれば作り直す。
+# 路線どうしは独立なので、作り直しは複数プロセスで並列に走らせる。
+
+
+def light_path(ref):
+    return os.path.join(DERIVED_DIR, f"r{ref}.pkl")
+
+
+def heavy_path(ref):
+    return os.path.join(DERIVED_DIR, f"r{ref}.graph.pkl")
+
+
+def _stamp(path):
+    """ファイルの大きさと更新時刻。無ければ None"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def junction_digest(jsig):
+    return hashlib.sha1(jsig.encode("utf-8")).hexdigest()
+
+
+def route_signature(ref, jdigest):
+    """その路線の導出データが今の入力から作られたものかを見る印"""
+    return (DERIVED_VERSION, jdigest,
+            _stamp(route_cache_path(ref)), _stamp(node_cache_path(ref)))
+
+
+def cached_route_refs():
+    """形状を取得済みの路線番号"""
+    refs = set()
+    if os.path.isdir(CACHE_DIR):
+        for name in os.listdir(CACHE_DIR):
+            if name.startswith("r") and name.endswith(".json"):
+                refs.add(name[1:-5])
+    return refs
+
+
+class Route:
+    """1路線ぶんの導出済みデータ。heavy は必要になるまで読まない。"""
+
+    def __init__(self, ref, light, heavy=None):
+        self.ref = ref
+        self.light = light
+        self._heavy = heavy
+        self._graph = None
+
+    @property
+    def heavy(self):
+        if self._heavy is None:
+            heavy = load_pickle(heavy_path(self.ref))
+            if heavy is None or heavy.get("sig") != self.light["sig"]:
+                raise RuntimeError(
+                    f"国道{self.ref}号の導出データが揃っていません。"
+                    f"{DERIVED_DIR} を消してから build し直してください。")
+            self._heavy = heavy
+        return self._heavy
+
+    @property
+    def graph(self):
+        if self._graph is None:
+            self._graph = RouteGraph(edges=self.heavy["edges"])
+        return self._graph
+
+    @property
+    def edges(self):
+        return self.heavy["edges"]
+
+    @property
+    def node_dist(self):
+        return self.heavy["node_dist"]
+
+    @property
+    def points(self):
+        return self.light["points"]
+
+    @property
+    def km(self):
+        return self.light["km"]
+
+    @property
+    def bounds(self):
+        return self.light["bounds"]
+
+
+def derive_route(ref, junctions, sig):
+    """1路線ぶんを形状から導いて cache/derived/ に書く。並列に呼ばれる側。
+
+    書いた light と辺（edges。形状が無ければ None）を返す。
+    """
+    ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
+    if not ways:
+        light = {"sig": sig, "ref": ref, "empty": True}
+        save_pickle(light_path(ref), light)
+        return light, None
+
+    graph = RouteGraph(ways)
+    start = graph.far_end()
+    node_dist = graph.dijkstra(start, [])[0] if start else {}
+
+    # 区間指定に使える地点。端からの km は地図の注記にも `@km` の解決にも同じ値を使う。
+    # グラフ上に無い地点（形状と交差点名の取得時期がずれた場合）は距離不明にする
+    points = []
+    for n in (load_json(node_cache_path(ref)) or {}).get("nodes") or []:
+        points.append({"name": n["name"], "lat": n["lat"], "lon": n["lon"],
+                       "kind": KIND_SIGNAL if n.get("signals") else KIND_PLAIN})
+    points += derived_nodes(ref, graph, node_dist, junctions)
+    for p in points:
+        km = node_dist.get(node_key((p["lon"], p["lat"])))
+        p["km"] = round(km, 1) if km is not None else None
+
+    keep, lines = {}, []
+    min_lat = min_lon = float("inf")
+    max_lat = max_lon = float("-inf")
+    for wid, coords in ways.items():
+        mask = simplify_mask(coords, SIMPLIFY_TOLERANCE)
+        keep[wid] = mask
+        line = [c for c, k in zip(coords, mask) if k]
+        if len(line) >= 2:
+            lines.append(line)
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        min_lat, max_lat = min(min_lat, min(lats)), max(max_lat, max(lats))
+        min_lon, max_lon = min(min_lon, min(lons)), max(max_lon, max(lons))
+
+    # heavy → light の順に書く。light が新しければ heavy も揃っていると見なせる
+    save_pickle(heavy_path(ref), {
+        "sig": sig, "ways": ways, "keys": graph.way_keys, "keep": keep,
+        "edges": graph.edges, "node_dist": node_dist, "bridged": graph.bridged,
+    })
+    light = {
+        "sig": sig, "ref": ref, "km": graph.total_km(),
+        "bounds": [[min_lat, min_lon], [max_lat, max_lon]],
+        "lines": lines, "points": points,
+    }
+    save_pickle(light_path(ref), light)
+    return light, graph.edges
+
+
+@without_gc
+def _derive_job(job):
+    ref, junctions, sig, want_edges = job
+    light, edges = derive_route(ref, junctions, sig)
+    return ref, light, (edges if want_edges else None)
+
+
+def derive_routes(refs, junctions, sigs, quiet=False, edge_sink=None):
+    """古い・無い導出データを作り直し、{路線番号: light} を返す。
+
+    路線どうしは独立なので複数プロセスで回す。
+    edge_sink に (dict, set) を渡すと、導いた辺を dict に足し、路線番号を set に入れる。
+    書いた直後のファイルを同じプロセスで読み直すと、ウイルス対策の検査が入って
+    何倍も遅い（実測で 2秒→11秒）。総延長の集計には、読み直さずにこちらを使う。
+    """
+    # 大きい路線から配ると、最後に1本だけ残って待つことが減る
+    refs = sorted(refs, key=lambda r: -(_stamp(route_cache_path(r)) or (0,))[0])
+    jobs = [(ref, junctions, sigs[ref], edge_sink is not None) for ref in refs]
+    if not quiet:
+        print(f"  {len(jobs)} 路線の形状からグラフとキロ程を導いています…"
+              "（キャッシュが変わったときだけ）", file=sys.stderr)
+
+    lights = {}
+
+    def take(result):
+        ref, light, edges = result
+        lights[ref] = light
+        if edges is not None and edge_sink is not None:
+            edge_sink[0].update(edges)
+            edge_sink[1].add(ref)
+
+    workers = min(DERIVE_WORKERS or os.cpu_count() or 1, len(jobs))
+    if workers > 1:
+        pool = concurrent.futures.ProcessPoolExecutor(workers)
+        try:
+            for result in pool.map(_derive_job, jobs, chunksize=2):
+                take(result)
+                if not quiet and len(lights) % 100 == 0:
+                    print(f"    {len(lights)}/{len(jobs)}", file=sys.stderr)
+            pool.shutdown()
+            return lights
+        except KeyboardInterrupt:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception as e:
+            # 並列化できない環境（子プロセスを起こせない等）では順に処理する
+            pool.shutdown(wait=False, cancel_futures=True)
+            if not quiet:
+                print(f"  並列処理を使えないので順に計算します（{e}）", file=sys.stderr)
+
+    for job in jobs:
+        take(_derive_job(job))
+    return lights
+
+
+def load_routes(refs, junctions, jsig, quiet=False, edge_sink=None):
+    """全路線の light を {路線番号: light} で返す。無い・古いものは作り直す。
+
+    edge_sink は derive_routes() にそのまま渡す。
+    """
+    jdigest = junction_digest(jsig)
+    sigs, lights, stale = {}, {}, []
+    for ref in refs:
+        if not os.path.exists(route_cache_path(ref)):
+            continue
+        sigs[ref] = route_signature(ref, jdigest)
+        light = load_pickle(light_path(ref))
+        if light is not None and light.get("sig") == sigs[ref]:
+            lights[ref] = light
+        else:
+            stale.append(ref)
+    if stale:
+        lights.update(derive_routes(stale, junctions, sigs, quiet, edge_sink))
+    return lights
+
+
+@without_gc
+def load_route(ref, junctions, jsig):
+    """1路線ぶんを heavy 込みで返す。形状が無ければ None。"""
+    if not os.path.exists(route_cache_path(ref)):
+        return None
+    sig = route_signature(ref, junction_digest(jsig))
+    light, heavy = load_pickle(light_path(ref)), load_pickle(heavy_path(ref))
+    fresh = (light is not None and light.get("sig") == sig
+             and (light.get("empty") or (heavy is not None and heavy.get("sig") == sig)))
+    if not fresh:
+        derive_route(ref, junctions, sig)
+        light, heavy = load_pickle(light_path(ref)), load_pickle(heavy_path(ref))
+    if light is None or light.get("empty"):
+        return None
+    return Route(ref, light, heavy)
+
+
+def _total_signature(jsig):
+    return (DERIVED_VERSION, junction_digest(jsig))
+
+
+def total_is_cached(jsig):
+    cached = load_pickle(TOTAL_PATH)
+    return bool(cached) and cached.get("sig") == _total_signature(jsig)
+
+
+def total_length_km(refs, jsig, quiet=False, known=None):
+    """全国の総延長。重複区間を二重に数えないよう、辺の集合の和で出す。
+
+    形状が変わったときだけ数え直す（heavy を全部読むので数秒かかる）。
+    known は (辺の和 dict, そこに含めた路線番号の集合)。導出したての路線は
+    ここに入れて渡し、書いたばかりのファイルを読み直さない。
+    """
+    sig = _total_signature(jsig)
+    cached = load_pickle(TOTAL_PATH)
+    if cached and cached.get("sig") == sig:
+        return cached["km"]
+    if not quiet:
+        print("  全国の総延長を数えています…", file=sys.stderr)
+    all_edges, counted = known if known is not None else ({}, set())
+    for ref in refs:
+        if ref in counted:
+            continue
+        heavy = load_pickle(heavy_path(ref))
+        if heavy:
+            all_edges.update(heavy["edges"])
+    total = sum(all_edges.values())
+    save_pickle(TOTAL_PATH, {"sig": sig, "km": total})
+    return total
+
+
+# --------------------------------------------------------------------------
 # build
 # --------------------------------------------------------------------------
 
-def add_named_nodes(acc, ref, node_dist, nodes):
-    """1路線ぶんの交差点名を acc に足しこむ。
+def add_named_nodes(acc, ref, points):
+    """1路線ぶんの地点を acc に足しこむ。
 
     重複区間では同じ交差点が複数の路線に現れるので、座標と名前でまとめ、
     「どの国道の何km地点か」を路線ぶんだけ並べて持つ。
-    node_dist は far_end() を起点としたキロ程（`@` 指定の解決と同じ値）。
-    グラフ上に見つからない交差点は距離を None にする。
+    km は導出時に far_end() を起点として測った値（`@` 指定の解決と同じ）。
+    グラフ上に見つからない地点は None。
     """
-    for n in nodes:
-        k = node_key([n["lon"], n["lat"]])
-        key = (k, n["name"])
+    for p in points:
+        key = (node_key((p["lon"], p["lat"])), p["name"])
         entry = acc.get(key)
         if entry is None:
-            kind = n.get("kind")
-            if kind is None:
-                kind = KIND_SIGNAL if n.get("signals") else KIND_PLAIN
-            entry = acc[key] = [round(n["lat"], 5), round(n["lon"], 5),
-                                n["name"], kind, []]
-        km = (node_dist or {}).get(k)
-        entry[4].append([ref, round(km, 1) if km is not None else None])
+            entry = acc[key] = [round(p["lat"], 5), round(p["lon"], 5),
+                                p["name"], p["kind"], []]
+        entry[4].append([ref, p["km"]])
 
 
 def finalize_named_nodes(acc):
@@ -1409,11 +1812,13 @@ def finalize_named_nodes(acc):
     return out
 
 
-def route_covered(ref, graph, recs, node_dist, nodes):
+def route_covered(route, recs):
     """1路線ぶんの走破した辺と、表示用の区間ラベル・走破日・メモを求める。
 
     build と serve の両方から呼ぶ（serve は編集された1路線だけ呼び直す）。
+    記録が1件でもあれば heavy を読むことになる。
     """
+    ref = route.ref
     covered = set()
     sections, dates, notes = [], [], []
 
@@ -1424,7 +1829,7 @@ def route_covered(ref, graph, recs, node_dist, nodes):
             notes.append(rec["note"])
 
         if rec["kind"] == "full":
-            covered |= set(graph.edges)
+            covered.update(route.edges)
             sections.append(FULL)
 
         elif rec["kind"] == "area":
@@ -1433,8 +1838,9 @@ def route_covered(ref, graph, recs, node_dist, nodes):
                 print(f"  国道{ref}号（{rec['area']}）が未取得です。"
                       f"`python kokudo_map.py fetch` を実行してください。", file=sys.stderr)
                 continue
+            edges = route.edges
             sub_graph = RouteGraph(adata.get("ways") or {})
-            hit = set(sub_graph.edges) & set(graph.edges)
+            hit = {key for key in sub_graph.edges if key in edges}
             if not hit:
                 print(f"  国道{ref}号（{rec['area']}）に該当する区間がありません。", file=sys.stderr)
                 continue
@@ -1442,7 +1848,8 @@ def route_covered(ref, graph, recs, node_dist, nodes):
             sections.append(rec["label"])
 
         elif rec["kind"] == "nodes":
-            edges, dist = resolve_node_section(graph, nodes, rec, ref, node_dist)
+            edges, dist = resolve_node_section(route.graph, route.points, rec, ref,
+                                               route.node_dist)
             if edges:
                 covered |= edges
                 sections.append(f"{rec['label']}（{dist:.0f} km）")
@@ -1450,38 +1857,55 @@ def route_covered(ref, graph, recs, node_dist, nodes):
     return covered, sections, dates, notes
 
 
-def route_points(ref, graph, node_dist, junctions):
-    """その路線で区間指定に使える地点。OSM の名前＋こちらで算出したもの。"""
-    osm = (load_json(node_cache_path(ref)) or {}).get("nodes") or []
-    return osm + derived_nodes(ref, graph, node_dist, junctions)
+def _feature(ref, kind, lines):
+    return {
+        "type": "Feature",
+        "properties": {"ref": ref, "kind": kind},
+        "geometry": {"type": "MultiLineString", "coordinates": lines},
+    }
 
 
-def route_features(ref, ways, covered):
-    """各wayを走破／未走破の連続部分に切り分けて GeoJSON Feature にする"""
+def _cut(coords, keep, s, e, into):
+    """coords[s..e] のうち間引きで残す印の付いた点を取り出す（両端は必ず残す）"""
+    into.append([coords[s]] + [coords[i] for i in range(s + 1, e) if keep[i]] + [coords[e]])
+
+
+def route_features(route, covered):
+    """各wayを走破／未走破の連続部分に切り分けて GeoJSON Feature にする。
+
+    間引きは導出時に way 全体へ掛けた印（keep）を使う。切れ目ごとに掛け直すより
+    速く、走破／未走破の境目で形が揺れない。
+    走破区間が無ければ導出済みの線をそのまま使う（heavy を読まずに済む）。
+    """
+    ref = route.ref
+    if not covered:
+        lines = route.light["lines"]
+        return [_feature(ref, "todo", lines)] if lines else []
+
+    heavy = route.heavy
+    keys_of, keep_of = heavy["keys"], heavy["keep"]
     done_lines, todo_lines = [], []
-    for coords in ways.values():
-        run, run_state = [], None
-        for i in range(len(coords) - 1):
-            a, b = node_key(coords[i]), node_key(coords[i + 1])
-            state = edge_key(a, b) in covered
-            if state != run_state:
-                if len(run) >= 2:
-                    (done_lines if run_state else todo_lines).append(run)
-                run, run_state = [coords[i]], state
-            run.append(coords[i + 1])
-        if len(run) >= 2:
-            (done_lines if run_state else todo_lines).append(run)
+    for wid, coords in heavy["ways"].items():
+        n = len(coords)
+        if n < 2:
+            continue
+        keys, keep = keys_of[wid], keep_of[wid]
+        start, state = 0, None
+        for i in range(n - 1):
+            a, b = keys[i], keys[i + 1]
+            if a == b:          # 同じ点が続くだけ。区切らない
+                continue
+            hit = ((a, b) if a <= b else (b, a)) in covered
+            if hit == state:
+                continue
+            if state is not None:
+                _cut(coords, keep, start, i, done_lines if state else todo_lines)
+            start, state = i, hit
+        if state is not None:
+            _cut(coords, keep, start, n - 1, done_lines if state else todo_lines)
 
-    out = []
-    for lines, kind in ((todo_lines, "todo"), (done_lines, "done")):
-        simplified = [s for s in (simplify(l, SIMPLIFY_TOLERANCE) for l in lines) if len(s) >= 2]
-        if simplified:
-            out.append({
-                "type": "Feature",
-                "properties": {"ref": ref, "kind": kind},
-                "geometry": {"type": "MultiLineString", "coordinates": simplified},
-            })
-    return out
+    return [_feature(ref, kind, lines)
+            for lines, kind in ((todo_lines, "todo"), (done_lines, "done")) if lines]
 
 
 def route_status(route_km, route_done_km, covered):
@@ -1490,72 +1914,60 @@ def route_status(route_km, route_done_km, covered):
     return "done" if route_done_km >= route_km * 0.98 else "partial"
 
 
-def build_data():
+@without_gc
+def build_data(quiet=False):
     records = read_records()
 
     by_ref = defaultdict(list)
     for rec in records:
         by_ref[rec["ref"]].append(rec)
 
-    cached_refs = set()
-    if os.path.isdir(CACHE_DIR):
-        for name in os.listdir(CACHE_DIR):
-            if name.startswith("r") and name.endswith(".json"):
-                cached_refs.add(name[1:-5])
+    all_refs = sorted(cached_route_refs() | set(by_ref), key=int)
 
-    all_refs = sorted(cached_refs | set(by_ref), key=int)
+    junctions, jsig = build_junction_index(all_refs, quiet)
+    # 総延長を数え直すなら、導出したての辺はファイルを読み直さず直接受け取る
+    known = None if total_is_cached(jsig) else ({}, set())
+    lights = load_routes(all_refs, junctions, jsig, quiet, edge_sink=known)
+    total_km = total_length_km(all_refs, jsig, quiet, known)
+    del known
 
     features, summary = [], []
-    total_km = 0.0
-    counted_edges = set()
     node_acc = {}
     covered_by_ref, edge_km = {}, {}
-    junctions = build_junction_index(all_refs)
 
     for ref in all_refs:
-        data = load_json(route_cache_path(ref))
-        ways = (data or {}).get("ways") or {}
-        if not ways:
+        light = lights.get(ref)
+        if not light or light.get("empty"):
             continue
-
+        route = Route(ref, light)
         recs = by_ref.get(ref, [])
-        # 起点からのキロ程。地図の注記にも `@` 指定の解決にも同じ値を使う
-        graph = RouteGraph(ways)
-        start = graph.far_end()
-        node_dist = graph.dijkstra(start, [])[0] if start else None
-        nodes_here = route_points(ref, graph, node_dist, junctions)
-        add_named_nodes(node_acc, ref, node_dist, nodes_here)
+        if recs:
+            covered, sections, dates, notes = route_covered(route, recs)
+        else:
+            covered, sections, dates, notes = set(), [], [], []
 
-        covered, sections, dates, notes = route_covered(ref, graph, recs, node_dist, nodes_here)
-
-        # 延長の集計
-        route_km = route_done_km = 0.0
-        for key, km in graph.edges.items():
-            route_km += km
-            hit = key in covered
-            if hit:
+        # 延長の集計。走破した辺の km は全国の集計（辺の和）にも使う
+        route_km, route_done_km = route.km, 0.0
+        if covered:
+            edges = route.edges
+            for key in covered:
+                km = edges[key]
                 route_done_km += km
                 edge_km[key] = km
-            if key not in counted_edges:
-                counted_edges.add(key)
-                total_km += km
 
-        status = route_status(route_km, route_done_km, covered)
         covered_by_ref[ref] = covered
-        features.extend(route_features(ref, ways, covered))
-
-        lats = [p[1] for c in ways.values() for p in c]
-        lons = [p[0] for c in ways.values() for p in c]
+        features.extend(route_features(route, covered))
+        add_named_nodes(node_acc, ref, route.points)
 
         summary.append({
             "ref": ref,
-            "status": status,
+            "status": route_status(route_km, route_done_km, covered),
             "km": round(route_km, 1),
             "doneKm": round(route_done_km, 1),
             "sections": sections,
             "dates": sorted(set(dates)),
             "notes": notes,
-            "bounds": [[min(lats), min(lons)], [max(lats), max(lons)]],
+            "bounds": route.bounds,
         })
 
     nodes = finalize_named_nodes(node_acc)
@@ -1588,6 +2000,7 @@ def build_data():
         "coveredByRef": covered_by_ref,
         "edgeKm": edge_km,
         "junctions": junctions,
+        "jsig": jsig,
     }
 
 
@@ -1739,23 +2152,19 @@ def set_eki_visit(pref, name, date, note):
 
 def recompute_ref(data, ref):
     """1路線だけ計算し直し、全国の集計も更新する。返り値はブラウザに返す差分。"""
-    ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
-    if not ways:
+    route = load_route(ref, data["junctions"], data["jsig"])
+    if route is None:
         return None
 
-    graph = RouteGraph(ways)
-    start = graph.far_end()
-    node_dist = graph.dijkstra(start, [])[0] if start else None
     recs = [r for r in read_records() if r["ref"] == ref]
-    nodes_here = route_points(ref, graph, node_dist, data.get("junctions") or {})
-    covered, sections, dates, notes = route_covered(ref, graph, recs, node_dist, nodes_here)
+    covered, sections, dates, notes = route_covered(route, recs)
 
-    route_km = route_done_km = 0.0
-    for key, km in graph.edges.items():
-        route_km += km
-        if key in covered:
-            route_done_km += km
-            data["edgeKm"][key] = km
+    route_km, route_done_km = route.km, 0.0
+    edges = route.edges
+    for key in covered:
+        km = edges[key]
+        route_done_km += km
+        data["edgeKm"][key] = km
 
     data["coveredByRef"][ref] = covered
 
@@ -1771,7 +2180,7 @@ def recompute_ref(data, ref):
         "notes": notes,
     })
 
-    features = route_features(ref, ways, covered)
+    features = route_features(route, covered)
     data["geojson"]["features"] = ([f for f in data["geojson"]["features"]
                                     if f["properties"]["ref"] != ref] + features)
     refresh_stats(data)
@@ -1926,25 +2335,22 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
             return {"ok": False, "error": "この区間は解釈できません"}
 
         ref = secs[0]["ref"]
-        ways = (load_json(route_cache_path(ref)) or {}).get("ways") or {}
-        if not ways:
+        route = load_route(ref, self.data["junctions"], self.data["jsig"])
+        if route is None:
             return {"ok": False, "error": f"国道{ref}号の形状がありません"}
 
-        graph = RouteGraph(ways)
-        start = graph.far_end()
-        node_dist = graph.dijkstra(start, [])[0] if start else None
-        nodes = route_points(ref, graph, node_dist, self.data.get("junctions") or {})
-        covered, _sections, _dates, _notes = route_covered(ref, graph, secs, node_dist, nodes)
+        covered, _sections, _dates, _notes = route_covered(route, secs)
         if not covered:
             return {"ok": False, "error": "この区間は地図上で特定できませんでした"}
 
-        feats = [f for f in route_features(ref, ways, covered)
+        feats = [f for f in route_features(route, covered)
                  if f["properties"]["kind"] == "done"]
         pts = [p for f in feats for line in f["geometry"]["coordinates"] for p in line]
         if not pts:
             return {"ok": False, "error": "この区間は地図上で特定できませんでした"}
+        edges = route.edges
         return {"ok": True, "ref": ref, "features": feats,
-                "km": round(sum(graph.edges[e] for e in covered), 1),
+                "km": round(sum(edges[e] for e in covered), 1),
                 "bounds": [[min(p[1] for p in pts), min(p[0] for p in pts)],
                            [max(p[1] for p in pts), max(p[0] for p in pts)]]}
 
@@ -2000,7 +2406,7 @@ def watch_browser():
 
 
 def cmd_serve(args):
-    print("地図を組み立てています…（初回は1分ほどかかります）")
+    print("地図を組み立てています…（キャッシュを整える初回だけ十数秒かかります）")
     data = build_data()
     if not data["summary"]:
         print("描ける路線がありません。先に `python kokudo_map.py fetch` を実行してください。",
