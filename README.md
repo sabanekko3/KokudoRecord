@@ -4,8 +4,10 @@
 走破済み＝赤／未走破＝青で塗り分けた日本地図が、そのまま記録帳になります。
 
 ```
-python kokudo_map.py serve
+python kokudo_map.py
 ```
+
+引数なしで実行すると地図が開きます（`serve` を書いたときと同じです）。
 
 道路の形状は OpenStreetMap から取ってきて `cache/` に貯めます。
 一度取得すればオフラインで何度でも地図を作り直せます。
@@ -38,7 +40,7 @@ python kokudo_map.py fetch --all
 ## 地図で記録する
 
 ```
-python kokudo_map.py serve
+python kokudo_map.py
 ```
 
 ブラウザが開きます。**記録はすべてこの画面から行えます。**
@@ -330,13 +332,19 @@ python kokudo_map.py nodes 351
 ## コマンド一覧
 
 ```
-python kokudo_map.py serve     地図を開く（記録はここから）
+python kokudo_map.py           地図を開く（記録はここから）
+python kokudo_map.py serve     同上。--port 8766 のように指定するときはこちらでも
 python kokudo_map.py build     閲覧用の kokudo_map.html を作る
 python kokudo_map.py fetch     routes.csv に出てくる路線のデータを取得
 python kokudo_map.py fetch --all   全国道のデータを取得（最初の1回）
 python kokudo_map.py nodes 17  国道17号で使える地点名の一覧
 python kokudo_map.py init      routes.csv のひな形を作る
+python kokudo_map.py -h        コマンドの一覧を出す
 ```
+
+**引数なしは `serve` と同じ**です。`--port 8766` のようにオプションだけを
+書いた場合も `serve` として扱います。`bulid` のような打ち間違いは
+そのままエラーになるので、黙って地図が開くことはありません。
 
 `serve` は編集した1路線だけを計算し直すので待たされません。
 
@@ -353,7 +361,17 @@ python kokudo_map.py init      routes.csv のひな形を作る
 `file://` で開いた HTML からはファイルに書き込めないという、ブラウザ側の制限です。
 `serve` は 127.0.0.1（自分のパソコンの中だけ）で待ち受ける小さなサーバを立てて、
 ブラウザからの保存要求を Python 側で受けて CSV に書きます。
-**外部には公開されません。** ポートを変えたいときは `--port 8766` のように指定します。
+**外部には公開されません。**
+
+### ポートのこと
+
+既定は 8765 番です。**塞がっていたら 8766, 8767… と自動で次を試す**ので、
+普段は気にする必要はありません。使ったポートは起動時に表示されます。
+決め打ちしたいときは `python kokudo_map.py serve --port 9000` のように指定します。
+
+**すでに地図を開いたまま、もう一度起動した場合は2つ目を立てません。**
+先に開いているほうをブラウザで表示するだけです。
+同じ記録を2つのプログラムが同時に書くと、片方の編集が消えてしまうためです。
 
 ---
 

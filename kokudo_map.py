@@ -3,21 +3,23 @@
 """
 国道走破マップ生成ツール v2
 
-走破した区間を routes.csv に書き足して build を実行すると，
-走破済み＝赤／未走破＝グレーで塗り分けた地図 (kokudo_map.html) が出来上がる。
+地図を開いて，走った道をクリックすると走破記録がたまっていく。
+走破済み＝赤／未走破＝青で塗り分けた地図 (kokudo_map.html) が出来上がる。
 
 区間の指定方法は4通り:
     全線
     新潟県                    都道府県まるごと
     新潟県長岡市              市町村まるごと
-    宮内〜川崎                交差点から交差点まで
+    宮内〜川崎                地点から地点まで
 
 使い方:
+    python kokudo_map.py                 地図を開く（引数なしは serve と同じ）
+    python kokudo_map.py serve           同上
     python kokudo_map.py init            routes.csv のひな形を作る
     python kokudo_map.py fetch           routes.csv に出てくる路線の形状を取得
     python kokudo_map.py fetch --all     全国道 (1〜507号) の形状を取得（初回のみ）
     python kokudo_map.py nodes 17        国道17号で使える交差点名の一覧を出す
-    python kokudo_map.py build           地図を生成
+    python kokudo_map.py build           閲覧用の静的な地図を生成
 
 依存ライブラリなし（標準ライブラリのみ）。
 """
@@ -39,6 +41,7 @@ import os
 import pickle
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -2068,6 +2071,10 @@ def cmd_build(args):
 # 全路線の再計算は40秒ほどかかるので、編集された1路線だけ計算し直して差分を返す。
 
 SERVE_PORT = 8765
+# 待ち受けたいポートが塞がっていたら、この数だけ次の番号を試す
+SERVE_PORT_TRIES = 10
+# 動いているのがこの地図かどうかを見分けるための合言葉（/api/hello が返す）
+APP_ID = "kokudo-map"
 # 地図の画面から何秒ごとに生存を知らせてもらうか
 PING_INTERVAL = 5.0
 # タブが閉じられた合図を受けてから、実際に終了するまでの猶予 [秒]。
@@ -2238,6 +2245,9 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
             with self.lock:
                 html = render_html(self.data, editable=True)
             self._send(200, html, "text/html; charset=utf-8")
+        elif self.path == "/api/hello":
+            # 二重起動の検出用。ここで待ち受けているのがこの地図かを知らせる
+            self._send(200, json.dumps({"app": APP_ID}))
         elif self.path == "/api/records":
             with self.lock:
                 rows = read_route_rows()
@@ -2387,6 +2397,44 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
         return out
 
 
+def port_taken(port):
+    """127.0.0.1 のそのポートで、誰かが待ち受けているか。
+
+    Windows では `allow_reuse_address` のせいで、使用中のポートにも bind が
+    通ってしまうことがある（Unix と意味が違う）。実際に繋いで確かめる。
+    """
+    with socket.socket() as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def running_here(port):
+    """そのポートで動いているのが、この地図かどうか"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/hello", timeout=2) as res:
+            return json.loads(res.read().decode("utf-8")).get("app") == APP_ID
+    except Exception:
+        return False
+
+
+def open_server(port):
+    """空いているポートで待ち受ける。(サーバ, 実際に使ったポート) を返す。
+
+    引数なしで起動できるようにした以上、ポート番号を指定し直せない場面がある。
+    塞がっていたら黙って次を試す。
+    """
+    last = None
+    for candidate in range(port, port + SERVE_PORT_TRIES):
+        if port_taken(candidate):
+            last = f"ポート {candidate} は使用中"
+            continue
+        try:
+            return http.server.ThreadingHTTPServer(("127.0.0.1", candidate), EditHandler), candidate
+        except OSError as e:
+            last = e
+    raise OSError(f"{port}〜{port + SERVE_PORT_TRIES - 1} に空きがありません（{last}）")
+
+
 def watch_browser():
     """地図の画面が閉じられたら、こちらも終了する。
 
@@ -2406,6 +2454,15 @@ def watch_browser():
 
 
 def cmd_serve(args):
+    # すでにこの地図が動いていたら、2つ目を立てずにそちらを開く。
+    # 同じ CSV を2つのプログラムが書くと、片方の編集が消える。
+    if port_taken(args.port) and running_here(args.port):
+        url = f"http://127.0.0.1:{args.port}/"
+        print(f"すでに {url} で開いています。そちらを表示します。")
+        print("（同じ記録を2つ同時に書くと片方が消えるので、二重には起動しません）")
+        webbrowser.open(url)
+        return
+
     print("地図を組み立てています…（キャッシュを整える初回だけ十数秒かかります）")
     data = build_data()
     if not data["summary"]:
@@ -2415,15 +2472,16 @@ def cmd_serve(args):
 
     EditHandler.data = data
     EditHandler.lock = threading.Lock()
-    url = f"http://127.0.0.1:{args.port}/"
 
     try:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), EditHandler)
+        server, port = open_server(args.port)
     except OSError as e:
-        print(f"ポート {args.port} を使えません（{e}）。"
-              f"`--port 8766` のように変えてください。", file=sys.stderr)
+        print(f"待ち受けを始められません（{e}）。", file=sys.stderr)
         sys.exit(1)
     EditHandler.server_ref = server
+    url = f"http://127.0.0.1:{port}/"
+    if port != args.port:
+        print(f"\nポート {args.port} は使用中でした。{port} を使います。")
 
     print(f"\n{url} で待ち受けています。ブラウザを開きます。")
     print("  道の駅の丸を押すと訪問済みを切り替えられます。")
@@ -3636,11 +3694,19 @@ def main():
     p = sub.add_parser("build", help="地図 HTML を生成する")
     p.set_defaults(func=cmd_build)
 
-    p = sub.add_parser("serve", help="地図から履歴を編集できる状態で開く")
+    p = sub.add_parser("serve", help="地図から履歴を編集できる状態で開く（引数なしと同じ）")
     p.add_argument("--port", type=int, default=SERVE_PORT, help=f"既定 {SERVE_PORT}")
     p.set_defaults(func=cmd_serve)
 
-    args = parser.parse_args()
+    # 普段は serve しか使わないので、引数なしで起動したら serve として扱う。
+    # ダブルクリックやショートカットからそのまま開けるようにするため。
+    # 打ち間違い（`bulid` など）は argparse に「選択肢が違う」と言ってほしいので、
+    # 補うのは「引数が無い」ときと「オプションだけ」のときに限る。
+    argv = sys.argv[1:]
+    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
+        argv = ["serve"] + argv
+
+    args = parser.parse_args(argv)
     args.func(args)
 
 
