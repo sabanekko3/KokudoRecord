@@ -39,6 +39,7 @@ import http.server
 import io
 import json
 import math
+import multiprocessing
 import os
 import pickle
 import random
@@ -57,7 +58,19 @@ from collections import defaultdict
 # 設定
 # --------------------------------------------------------------------------
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def app_dir():
+    """記録とキャッシュを置く場所。
+
+    exe にすると `__file__` は展開先の一時フォルダを指してしまうので、
+    そこを基準にすると記録が毎回消える。exe のある場所を使うこと。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+FROZEN = getattr(sys, "frozen", False)
+BASE_DIR = app_dir()
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 AREA_DIR = os.path.join(CACHE_DIR, "area")
 NODE_DIR = os.path.join(CACHE_DIR, "nodes")
@@ -157,6 +170,16 @@ CROSS_MERGE_KM = 0.15
 # 同じ地点に複数の呼び名が付くときの区切り。区間欄にはどちらの名前でも書ける
 # （`match_named_nodes` の部分一致で拾える）ので、この文字は名前に使わないこと。
 NAME_SEP = "／"
+
+def how_to(command):
+    """利用者に伝える操作方法。exe を渡された人はコマンドを打てない。"""
+    if FROZEN:
+        return {"init": "地図から区間を追加してください",
+                "fetch": "配布された cache フォルダを、このプログラムと"
+                         f"同じ場所（{BASE_DIR}）に置いてください",
+                "build": "地図はもう開いています"}.get(command, "")
+    return f"`python kokudo_map.py {command}` を実行してください"
+
 
 FULL = "全線"
 # 交差点区間の区切り文字
@@ -762,10 +785,22 @@ def parse_row(raw_ref, raw_section, date, note, line_no=0, quiet=False):
     return out
 
 
+def ensure_records_file():
+    """routes.csv が無ければ見出しだけ作る。
+
+    **ひな形の中身は書かないこと。** 行があるだけで走破扱いになり、
+    渡した相手の地図が最初から赤く塗られてしまう。
+    """
+    if os.path.exists(CSV_PATH):
+        return
+    with open(CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        csv.writer(f, lineterminator="\n").writerow(ROUTE_HEADER)
+    print(f"{CSV_PATH} を作りました。地図から区間を足していけます。")
+
+
 def read_records():
     if not os.path.exists(CSV_PATH):
-        print(f"{CSV_PATH} がありません。先に `python kokudo_map.py init` を実行してください。",
-              file=sys.stderr)
+        print(f"{CSV_PATH} がありません。{how_to('init')}。", file=sys.stderr)
         sys.exit(1)
 
     records = []
@@ -2000,7 +2035,7 @@ def route_covered(route, recs):
             adata = load_json(area_cache_path(ref, rec["area"]))
             if adata is None:
                 print(f"  国道{ref}号（{rec['area']}）が未取得です。"
-                      f"`python kokudo_map.py fetch` を実行してください。", file=sys.stderr)
+                      f"{how_to('fetch')}。", file=sys.stderr)
                 continue
             edges = route.edges
             sub_graph = RouteGraph(adata.get("ways") or {})
@@ -2080,6 +2115,7 @@ def route_status(route_km, route_done_km, covered):
 
 @without_gc
 def build_data(quiet=False):
+    ensure_records_file()
     records = read_records()
 
     by_ref = defaultdict(list)
@@ -2198,8 +2234,7 @@ def cmd_build(args):
     geojson, summary = data["geojson"], data["summary"]
     stats, nodes, eki = data["stats"], data["nodes"], data["eki"]
     if not summary:
-        print("描ける路線がありません。先に `python kokudo_map.py fetch` を実行してください。",
-              file=sys.stderr)
+        print(f"描ける路線がありません。{how_to('fetch')}。", file=sys.stderr)
         sys.exit(1)
 
     html = render_html(data, editable=False)
@@ -2627,8 +2662,7 @@ def cmd_serve(args):
     print("地図を組み立てています…（キャッシュを整える初回だけ十数秒かかります）")
     data = build_data()
     if not data["summary"]:
-        print("描ける路線がありません。先に `python kokudo_map.py fetch` を実行してください。",
-              file=sys.stderr)
+        print(f"描ける路線がありません。{how_to('fetch')}。", file=sys.stderr)
         sys.exit(1)
 
     EditHandler.data = data
@@ -3881,4 +3915,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # exe では、これが無いと導出の子プロセスが exe 全体を再実行して増殖する
+    multiprocessing.freeze_support()
     main()
