@@ -202,12 +202,70 @@ python kokudo_map.py build
 
 ---
 
+## スマホから使う（記録を GitHub で共有する）
+
+自分でサーバを立てずに、スマホでも同じ記録を見て・足せるようにする仕組みです。
+計算は GitHub Actions に任せ、出来た地図を GitHub Pages が配信します。
+
+- 記録（routes.csv / michinoeki.csv）だけを入れた **非公開** のリポジトリを作り、
+  本体フォルダの `記録/` に clone しておく
+- PC では `python kokudo_map.py` が起動時に pull し、地図から書き込むたびに push する
+- スマホでは公開された地図を開き、地点を選ぶと CSV に足す1行が出る。
+  それを GitHub の編集画面に貼って Commit すると、1〜2分で地図が作り直される
+
+**地図は公開 URL になります。** 記録の CSV は非公開のままですが、地図を見れば
+走った場所は分かります。
+
+### 最初の設定（1回だけ）
+
+1. GitHub で非公開リポジトリを作る（例: `kokudo-records`。README などは付けない）
+2. token を作る。GitHub の Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token。
+   Repository access は「Only select repositories」で本体（KokudoRecord）だけ、
+   Permissions は Repository permissions の Contents を「Read and write」。
+   出来た文字列を控える（この画面を閉じると二度と見られません）
+3. 記録リポジトリの Settings → Secrets and variables → Actions → New repository secret で、
+   Name に `PAGES_TOKEN`、Secret に控えた文字列を入れる
+4. 本体フォルダで次を実行する（`記録/` は最初から git リポジトリになっています）
+
+   ```
+   cd 記録
+   git remote add origin https://github.com/<ユーザー名>/kokudo-records.git
+   git push -u origin main
+   ```
+
+   push すると記録リポジトリの Actions タブで「地図を作って公開する」が動き、
+   本体リポジトリに `gh-pages` 枝が出来ます
+5. 本体リポジトリの Settings → Pages → Build and deployment の Source を
+   「Deploy from a branch」、Branch を `gh-pages` と `/ (root)` にして Save
+6. 数分後に `https://<ユーザー名>.github.io/KokudoRecord/` で地図が開く
+
+`記録/` は本体の `.gitignore` に入っているので、本体リポジトリには混ざりません。
+`記録/.github/workflows/build.yml` の `APP_REPO` が本体リポジトリの名前です。
+別の名前で使う場合はそこを直してください。
+
+### ふだんの使いかた
+
+- PC: 今までどおり `python kokudo_map.py`。起動時に「記録を同期しています」と出て、
+  スマホで足した分が取り込まれます。地図からの書き込みは数秒後に GitHub へ送られます
+- スマホ: 地図を開いて地点を選び、出てきた行を「この行をコピー」→「GitHub で開く」→
+  末尾に貼り付け → Commit changes（記録リポジトリの README にも書いてあります）
+- 手で同期したいときは `python kokudo_map.py sync`。`serve --no-sync` で同期を止められます
+
+同時に書いても壊れません。追記どうしがぶつかったときは両方の行を残します
+（記録リポジトリの `.gitattributes` の `merge=union`）。
+同期に失敗しても記録は PC の CSV に残り、次に起動したときに送られます。
+token には期限があります。Actions が失敗するようになったら作り直して Secret を更新してください。
+
+---
+
 ## CSV を直接編集する（任意）
 
 **通常は必要ありません。** 地図の画面からすべて記録できます。
 
 ただし記録は素直な CSV なので、まとめて書き足したいときや、
 Excel で一覧したいときは直接編集しても構いません。
+`記録/` フォルダがあれば CSV はそこにあります（無ければ本体と同じ場所）。
 地図を開いたまま編集した場合は、`serve` を一度終了して開き直してください。
 
 ### routes.csv
@@ -339,6 +397,7 @@ python kokudo_map.py fetch     routes.csv に出てくる路線のデータを�
 python kokudo_map.py fetch --all   全国道のデータを取得（最初の1回）
 python kokudo_map.py nodes 17  国道17号で使える地点名の一覧
 python kokudo_map.py init      routes.csv のひな形を作る
+python kokudo_map.py sync      記録を GitHub と同期する（記録/ が git のとき）
 python kokudo_map.py -h        コマンドの一覧を出す
 ```
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import csv
 import functools
 import gc
@@ -44,7 +45,9 @@ import os
 import pickle
 import random
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -81,8 +84,23 @@ JUNCTION_PATH = os.path.join(CACHE_DIR, "junctions.json")
 DERIVED_DIR = os.path.join(CACHE_DIR, "derived")
 TOTAL_PATH = os.path.join(DERIVED_DIR, "total.pkl")
 EKI_DIR = os.path.join(CACHE_DIR, "michinoeki")
-CSV_PATH = os.path.join(BASE_DIR, "routes.csv")
-EKI_CSV_PATH = os.path.join(BASE_DIR, "michinoeki.csv")
+
+# 記録（routes.csv / michinoeki.csv）の置き場。
+# `記録/` フォルダがあればそちらを使う。スマホと共有するときは、ここを
+# 非公開の git リポジトリ（記録だけを入れたもの）にしておくと、serve が
+# 起動時と書き込みのたびに pull / push して同期する（`RecordSync`）。
+# 無ければ今までどおり本体と同じ場所。exe を渡された人はこちら。
+RECORDS_DIR_NAME = "記録"
+
+
+def records_dir():
+    path = os.path.join(BASE_DIR, RECORDS_DIR_NAME)
+    return path if os.path.isdir(path) else BASE_DIR
+
+
+RECORDS_DIR = records_dir()
+CSV_PATH = os.path.join(RECORDS_DIR, "routes.csv")
+EKI_CSV_PATH = os.path.join(RECORDS_DIR, "michinoeki.csv")
 OUT_PATH = os.path.join(BASE_DIR, "kokudo_map.html")
 
 OVERPASS_ENDPOINTS = [
@@ -856,7 +874,7 @@ def sync_eki_csv(stations):
                          "訪問日": rec["date"], "メモ": rec["note"]})
 
     with open(EKI_CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=EKI_HEADER)
+        w = csv.DictWriter(f, fieldnames=EKI_HEADER, lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
     return len(missing)
@@ -2204,12 +2222,57 @@ def build_data(quiet=False):
     }
 
 
-def render_html(data, editable=False):
-    """地図の HTML を組み立てる。editable=True なら serve 用の編集UIが出る。"""
+def _git_in_records(*args):
+    """記録/ で git を1つ実行して標準出力を返す。使えなければ空文字。"""
+    if os.path.normcase(RECORDS_DIR) == os.path.normcase(BASE_DIR) or not shutil.which("git"):
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", RECORDS_DIR, *args], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def records_repo():
+    """記録リポジトリの GitHub 上の名前（owner/name）。分からなければ None。
+
+    Actions の中では環境変数 KOKUDO_RECORDS_REPO で渡す。手元では 記録/ の
+    origin から読む。
+    """
+    repo = os.environ.get("KOKUDO_RECORDS_REPO", "").strip()
+    if not repo:
+        m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+                      _git_in_records("remote", "get-url", "origin"))
+        repo = m.group(1) if m else ""
+    return repo or None
+
+
+def compose_config():
+    """静的な地図に付ける「GitHub に貼る行を出す」入力の設定。
+
+    記録リポジトリが分からなければ None（ボタンを出さない）。
+    """
+    repo = records_repo()
+    if not repo:
+        return None
+    branch = (os.environ.get("KOKUDO_RECORDS_BRANCH", "").strip()
+              or _git_in_records("symbolic-ref", "--short", "HEAD") or "main")
+    base = f"https://github.com/{repo}/edit/{branch}/"
+    return {"repo": repo, "routes": base + "routes.csv", "eki": base + "michinoeki.csv"}
+
+
+def render_html(data, editable=False, compose=None):
+    """地図の HTML を組み立てる。
+
+    editable=True なら serve 用の編集UIが出る。compose は静的な地図に付ける
+    「GitHub に貼る行を出す」入力の設定（`compose_config()`）。両方は付けない。
+    """
     config = {"basemap": DEFAULT_BASEMAP, "opacity": BASEMAP_OPACITY,
               "showTodo": bool(SHOW_TODO), "showNodes": bool(SHOW_NODES),
               "nodeZoom": NODE_MIN_ZOOM, "labelZoom": LABEL_MIN_ZOOM,
               "showEki": bool(SHOW_EKI), "editable": bool(editable),
+              "compose": None if editable else compose,
               "colors": {"done": DONE_COLOR, "todo": TODO_COLOR, "select": SELECT_COLOR}}
     return (HTML_TEMPLATE
             .replace("__GEOJSON__", json.dumps(data["geojson"], separators=(",", ":")))
@@ -2237,12 +2300,15 @@ def cmd_build(args):
         print(f"描ける路線がありません。{how_to('fetch')}。", file=sys.stderr)
         sys.exit(1)
 
-    html = render_html(data, editable=False)
+    compose = compose_config()
+    html = render_html(data, editable=False, compose=compose)
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
 
     pct = stats["doneKm"] / stats["totalKm"] * 100 if stats["totalKm"] else 0
     print(f"\n{OUT_PATH} を書き出しました（{os.path.getsize(OUT_PATH)/1024/1024:.1f} MB）")
+    if compose:
+        print(f"  スマホ用の入力: 地点を選ぶと {compose['repo']} に貼る行が出ます")
     print(f"  収録路線 : {stats['totalRoutes']} 本")
     print(f"  全線走破 : {stats['doneRoutes']} 本（一部走破 {stats['partialRoutes']} 本）")
     print(f"  距離走破率: {stats['doneKm']:,} / {stats['totalKm']:,} km = {pct:.1f}%")
@@ -2348,7 +2414,7 @@ def set_eki_visit(pref, name, date, note):
     if not found:
         rows.append({"都道府県": pref, "道の駅": name, "訪問日": date, "メモ": note or ""})
     with open(EKI_CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=EKI_HEADER)
+        w = csv.DictWriter(f, fieldnames=EKI_HEADER, lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
 
@@ -2414,6 +2480,7 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
     last_seen = 0.0         # 地図の画面から最後に合図が来た時刻
     goodbye_at = 0.0        # タブが閉じられた合図が来た時刻
     stopping = False
+    sync = None             # 記録の同期（RecordSync）。使わないときは None
 
     def log_message(self, fmt, *args):
         pass          # アクセスログは出さない
@@ -2488,6 +2555,9 @@ class EditHandler(http.server.BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
             return
 
+        if (EditHandler.sync and result.get("ok")
+                and self.path in ("/api/eki", "/api/section", "/api/record")):
+            EditHandler.sync.schedule()      # 少し待ってまとめて GitHub へ送る
         self._send(200, json.dumps(result, ensure_ascii=False))
 
     # -- 道の駅 ----------------------------------------------------------
@@ -2649,6 +2719,198 @@ def watch_browser():
             return
 
 
+# --------------------------------------------------------------------------
+# 記録の同期（記録/ が git リポジトリのとき）
+# --------------------------------------------------------------------------
+#
+# スマホからでも同じ記録を触れるようにする仕組み。自分ではサーバを持たない。
+#
+# - 記録（routes.csv / michinoeki.csv）だけを入れた非公開の git リポジトリを
+#   `記録/` に clone しておく
+# - スマホからは GitHub の画面で CSV に行を足す。push を受けた GitHub Actions が
+#   地図を作り直して公開する（記録リポジトリ側の .github/workflows/build.yml）
+# - PC では serve が起動時に pull し、地図から書き込むたびに commit → push する
+#
+# 同時に書いても壊れないよう、記録リポジトリの .gitattributes で CSV を
+# `merge=union` にしてある（追記どうしがぶつかったら両方の行を残す）。
+# 同期に失敗しても記録はこのパソコンの CSV に残り、地図は普通に使える。
+
+RECORD_FILES = ("routes.csv", "michinoeki.csv")
+SYNC_DEBOUNCE = 5.0     # 書き込みから push までの間（続けての編集を1回にまとめる）
+GIT_TIMEOUT = 60        # 1回の git 操作に許す秒数（回線が無いときに固まらないため）
+
+
+class SyncError(Exception):
+    """同期のどこかで失敗した。記録は手元に残っている。"""
+
+
+class RecordSync:
+    """記録フォルダの git リポジトリを、起動時と書き込み後に同期する。
+
+    使えないときは `available` が False で、`reason` に理由が入る。
+    その場合は何もしない（今までどおり手元の CSV だけを使う）。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.git = shutil.which("git")
+        self.lock = threading.Lock()      # git 操作を直列にする
+        self.guard = None                 # commit の間だけ握る外の鍵（EditHandler.lock）
+        self._timer = None
+        self._tlock = threading.Lock()
+        self.available, self.reason = self._check()
+
+    # -- git を呼ぶ ---------------------------------------------------------
+    def _run(self, *args, timeout=GIT_TIMEOUT):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")   # 入力待ちで固まらない
+        return subprocess.run([self.git, "-C", self.path, *args],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env=env, timeout=timeout)
+
+    @staticmethod
+    def _why(result):
+        lines = [ln for ln in (result.stderr or result.stdout).splitlines() if ln.strip()]
+        return lines[-1].strip() if lines else f"git が {result.returncode} で終わりました"
+
+    def _check(self):
+        if os.path.normcase(self.path) == os.path.normcase(BASE_DIR):
+            # 本体と同じ場所なら、それは本体のリポジトリ。記録を混ぜてはいけない
+            return False, f"{RECORDS_DIR_NAME}/ フォルダがありません"
+        if not os.path.exists(os.path.join(self.path, ".git")):
+            return False, f"{self.path} は git リポジトリではありません"
+        if not self.git:
+            return False, "git が見つかりません"
+        r = self._run("rev-parse", "--abbrev-ref", "@{u}", timeout=15)
+        if r.returncode != 0:
+            return False, ("push 先が設定されていません"
+                           f"（{RECORDS_DIR_NAME}/ で git push -u origin main を一度実行してください）")
+        return True, ""
+
+    # -- 部品 ---------------------------------------------------------------
+    def _lines(self):
+        """記録ファイルの行（取り込んだ件数を数えるため）"""
+        out = {}
+        for name in RECORD_FILES:
+            try:
+                with open(os.path.join(self.path, name), encoding="utf-8-sig") as f:
+                    out[name] = [ln.rstrip("\r\n") for ln in f]
+            except OSError:
+                out[name] = []
+        return out
+
+    def commit(self):
+        """記録ファイルに変更があればコミットする。コミットしたら True。"""
+        r = self._run("status", "--porcelain", "--", *RECORD_FILES, timeout=15)
+        if r.returncode != 0:
+            raise SyncError(f"状態を調べられませんでした: {self._why(r)}")
+        if not r.stdout.strip():
+            return False
+        r = self._run("add", "--", *RECORD_FILES, timeout=15)
+        if r.returncode != 0:
+            raise SyncError(f"変更を拾えませんでした: {self._why(r)}")
+        r = self._run("commit", "-q", "-m", "記録を更新", "--", *RECORD_FILES)
+        if r.returncode != 0:
+            raise SyncError(f"コミットできませんでした: {self._why(r)}")
+        return True
+
+    def pull(self):
+        """origin の変更を取り込む。手元のコミットはその上に載せ直す。"""
+        r = self._run("pull", "--rebase", "-q")
+        if r.returncode != 0:
+            # 途中で止まっていたら元に戻す。記録は手元のコミットに残る
+            self._run("rebase", "--abort", timeout=15)
+            raise SyncError(f"取り込めませんでした: {self._why(r)}")
+
+    def _ahead(self):
+        r = self._run("rev-list", "--count", "@{u}..HEAD", timeout=15)
+        return r.returncode == 0 and r.stdout.strip() not in ("", "0")
+
+    def push(self):
+        r = self._run("push", "-q")
+        if r.returncode == 0:
+            return
+        # スマホ側が先に進んでいたら、取り込んでからもう一度だけ
+        self.pull()
+        r = self._run("push", "-q")
+        if r.returncode != 0:
+            raise SyncError(f"送れませんでした: {self._why(r)}")
+
+    # -- まとめて ------------------------------------------------------------
+    def sync(self):
+        """commit → pull → push をひととおり行い、結果を1行で返す。"""
+        got, pushed = [], False
+        try:
+            with self.lock:
+                with (self.guard or contextlib.nullcontext()):
+                    self.commit()
+                before = self._lines()
+                self.pull()
+                after = self._lines()
+                for name in RECORD_FILES:
+                    if after[name] != before[name]:
+                        got.append(f"{name} +{len(set(after[name]) - set(before[name]))}行")
+                if self._ahead():
+                    self.push()
+                    pushed = True
+        except SyncError as e:
+            return f"{e}（記録はこのパソコンに残っています）"
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"git を実行できませんでした: {e}"
+        bits = []
+        if got:
+            bits.append("スマホからの記録を取り込みました（" + "、".join(got) + "）")
+        if pushed:
+            bits.append("記録を GitHub に送りました")
+        return "。".join(bits) if bits else "記録は最新です"
+
+    def schedule(self):
+        """書き込みのあと少し待ってから送る。続けての編集は1回にまとめる。"""
+        if not self.available:
+            return
+        with self._tlock:
+            if self._timer:
+                self._timer.cancel()
+            self._timer = threading.Timer(SYNC_DEBOUNCE, self._flush_quietly)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _flush_quietly(self):
+        msg = self.flush()
+        if msg != "記録は最新です":
+            print(f"  {msg}", file=sys.stderr)
+
+    def flush(self):
+        """溜まっている変更を今すぐ送る（終了時にも呼ぶ）"""
+        with self._tlock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+        return self.sync()
+
+
+def start_sync():
+    """記録/ が git リポジトリなら同期を用意し、起動時の同期をして返す。"""
+    if os.path.normcase(RECORDS_DIR) == os.path.normcase(BASE_DIR):
+        return None
+    sync = RecordSync(RECORDS_DIR)
+    if not sync.available:
+        print(f"（記録の同期はしません: {sync.reason}）")
+        return None
+    print("記録を同期しています…")
+    print("  " + sync.sync())
+    return sync
+
+
+def cmd_sync(args):
+    sync = RecordSync(RECORDS_DIR)
+    if not sync.available:
+        print(f"記録の同期は使えません: {sync.reason}", file=sys.stderr)
+        print(f"  {RECORDS_DIR_NAME}/ を記録用の git リポジトリにすると使えます"
+              "（README の「スマホから使う」）", file=sys.stderr)
+        sys.exit(1)
+    print(sync.sync())
+
+
 def cmd_serve(args):
     # すでにこの地図が動いていたら、2つ目を立てずにそちらを開く。
     # 同じ CSV を2つのプログラムが書くと、片方の編集が消える。
@@ -2659,6 +2921,7 @@ def cmd_serve(args):
         webbrowser.open(url)
         return
 
+    sync = None if args.no_sync else start_sync()
     print("地図を組み立てています…（キャッシュを整える初回だけ十数秒かかります）")
     data = build_data()
     if not data["summary"]:
@@ -2667,6 +2930,9 @@ def cmd_serve(args):
 
     EditHandler.data = data
     EditHandler.lock = threading.Lock()
+    EditHandler.sync = sync
+    if sync:
+        sync.guard = EditHandler.lock     # commit の間は CSV を書かせない
 
     try:
         server, port = open_server(args.port)
@@ -2682,6 +2948,8 @@ def cmd_serve(args):
     print("  道の駅の丸を押すと訪問済みを切り替えられます。")
     print("  交差点名を押して「ここから」→「ここまで」で区間を追加できます。")
     print("  編集はその場で routes.csv / michinoeki.csv に書き込まれます。")
+    if sync:
+        print("  書き込みは数秒後に GitHub へ送られます（スマホで見る地図も作り直されます）。")
     print("\n  終わるときは、地図の右上の「終了」を押すか、ブラウザのタブを閉じてください。")
     print("  この画面は自動で閉じます。\n")
     webbrowser.open(url)
@@ -2691,6 +2959,9 @@ def cmd_serve(args):
     except KeyboardInterrupt:
         EditHandler.stop("\n終了します。")
     server.server_close()
+    if sync:
+        print("記録を同期しています…")
+        print("  " + sync.flush())
     print("終了しました。")
 
 
@@ -2829,6 +3100,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           background: #fff8e6; font-size: 11.5px; line-height: 1.7; }
   #edit.on { display: block; }
   #edit b { color: #a86400; }
+  #edit input.line { width: 100%; box-sizing: border-box; margin: 4px 0; padding: 6px 8px;
+                     font: 12px ui-monospace, Consolas, monospace; border: 1px solid var(--rule);
+                     border-radius: 5px; background: #fff; color: var(--ink); }
+  #edit .hint { display: block; color: #6c7a89; margin-top: 4px; }
+  a.btn { text-decoration: none; display: inline-block; }
+  /* 指で押す端末ではボタンを大きく */
+  @media (pointer: coarse) { .btn { font-size: 13px; padding: 7px 12px; } }
   .btn { font: inherit; font-size: 11px; padding: 3px 9px; margin: 2px 3px 0 0;
          border: 1px solid var(--rule); border-radius: 5px; background: #fff;
          color: var(--ink); cursor: pointer; }
@@ -3009,6 +3287,10 @@ let recHighlight = null;   // 記録タブで選んだ区間の形（縁取り�
 
 // 編集用の状態。道の駅レイヤがこれらを使うので、必ずレイヤ生成より前に置くこと。
 const EDITABLE = !!CONFIG.editable;
+// 静的な地図（build）でスマホから記録するための入力。保存先が無いので、
+// CSV に足す1行を組み立てて GitHub の編集画面へ貼ってもらう
+const COMPOSE = !EDITABLE && !!CONFIG.compose;
+const PICK = EDITABLE || COMPOSE;      // 「ここから／ここまで」を出すか
 const editEl = document.getElementById("edit");
 const ekiMarkers = [];          // EKI と同じ並びのマーカー
 let pending = null;             // 区間の始点として選んだ交差点
@@ -3141,7 +3423,7 @@ function linePopupHtml(refs) {
   const rows = refs.map(ref => {
     const s = byRef[ref];
     if (!s) return "";
-    const act = !EDITABLE ? ""
+    const act = !PICK ? ""
       : (pending && pending.ref === ref
         ? `<button class="btn go" data-pt-finish="${ref}">ここまで</button>`
         : `<button class="btn" data-pt-start="${ref}">ここから</button>`);
@@ -3381,7 +3663,7 @@ map.on("click", (e) => {
       ? `<span style="color:#6c7a89">距離不明</span>　<code>${here}</code>`
       : `${km} km　<code>${canon}@${km}</code>`;
     let act = "";
-    if (EDITABLE) {
+    if (PICK) {
       act = (pending && pending.ref === pair[0])
         ? `<button class="btn go" data-finish="${pair[0]}">ここまで</button>`
         : `<button class="btn" data-start="${pair[0]}">ここから</button>`;
@@ -3487,6 +3769,62 @@ async function post(path, body) {
 function showEdit(html) {
   editEl.innerHTML = html;
   editEl.classList.toggle("on", !!html);
+  // スマホでは帯が画面の下の方に来るので、見える位置まで送る
+  if (html) editEl.scrollIntoView({ block: "nearest" });
+}
+
+// ---- スマホ用の入力（build した地図のとき） ----
+// 静的な地図には保存先が無い。代わりに routes.csv / michinoeki.csv に足す
+// 1行を組み立てて見せ、GitHub の編集画面に貼ってもらう。
+// Commit すると記録リポジトリの Actions が地図を作り直す。
+function csvCell(v) {
+  return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+
+function composeBox(title, line, url, hint) {
+  showEdit(`${title}<br>` +
+    `<input class="line" id="composeLine" readonly value="${esc(line)}">` +
+    `<div><button class="btn go" data-copy="1">この行をコピー</button>` +
+    (url ? `<a class="btn" href="${esc(url)}" target="_blank" rel="noopener">GitHub で開く</a>` : "") +
+    `<button class="btn" data-cancel="1">閉じる</button></div>` +
+    `<span class="hint">${hint}</span>`);
+}
+
+function composeSection(ref, a, b, section) {
+  const line = [ref, section, today(), ""].map(csvCell).join(",");
+  composeBox(`国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b>`, line, CONFIG.compose.routes,
+    "routes.csv の末尾にこの行を貼り付けて「Commit changes」を押してください。" +
+    "1〜2分で地図が更新されます。");
+  map.closePopup();
+}
+
+function composeEki(i) {
+  const e = EKI[i];
+  if (e[4]) {
+    composeBox(`道の駅 <b>${esc(e[2])}</b> の訪問を取り消す`, `${e[3]},${e[2]},,`, CONFIG.compose.eki,
+      `michinoeki.csv で「${esc(e[3])},${esc(e[2])}」の行（複数あれば一番下）の訪問日を消して` +
+      "「Commit changes」を押してください。");
+  } else {
+    const line = [e[3], e[2], today(), ""].map(csvCell).join(",");
+    composeBox(`道の駅 <b>${esc(e[2])}</b> に行った`, line, CONFIG.compose.eki,
+      "michinoeki.csv の末尾にこの行を貼り付けて「Commit changes」を押してください。" +
+      "同じ駅の行が2つになっても、あとの行（訪問日のある方）が使われます。");
+  }
+  map.closePopup();
+}
+
+async function copyLine() {
+  const input = document.getElementById("composeLine");
+  if (!input) return;
+  try {
+    await navigator.clipboard.writeText(input.value);
+  } catch (err) {
+    input.focus();
+    input.select();
+    document.execCommand("copy");
+  }
+  const btn = editEl.querySelector("button[data-copy]");
+  if (btn) btn.textContent = "コピーしました";
 }
 
 function refreshStats(stats) {
@@ -3511,7 +3849,7 @@ function ekiPopup(i) {
     `<br><span style="font-size:11px;color:#6c7a89">${esc(e[3])}</span>` +
     (been ? `<br>訪問: ${esc(e[5])}` : `<br><span style="color:#6c7a89">未訪問</span>`) +
     (e[6] ? `<br>${esc(e[6])}` : "") +
-    (EDITABLE
+    (PICK
       ? `<br><button class="btn ${been ? "off" : "go"}" data-eki="${i}">`
         + (been ? "訪問を取り消す" : "行った") + `</button>`
       : "");
@@ -3520,6 +3858,7 @@ function ekiPopup(i) {
 async function toggleEki(i) {
   const e = EKI[i], marker = ekiMarkers[i];
   if (!e || !marker) return;
+  if (COMPOSE) { composeEki(i); return; }
   const been = e[4];
   const date = been ? "" : today();
   const out = await post("/api/eki", { pref: e[3], name: e[2], date: date });
@@ -3549,6 +3888,7 @@ async function finishSection(ref, label, text) {
   pending = null;
   showEdit(`国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b> を保存しています…`);
   const section = `${a.text}〜${b.text}`;
+  if (COMPOSE) { composeSection(ref, a, b, section); return; }
   try {
     const out = await post("/api/section", { ref: ref, section: section, date: today() });
     applyRouteUpdate(ref, out);
@@ -3586,7 +3926,7 @@ function applyRouteUpdate(ref, out) {
 
 // 地図・ポップアップ・帯のボタンをまとめて受ける
 document.addEventListener("click", (ev) => {
-  const btn = ev.target.closest("button[data-eki], button[data-start], " +
+  const btn = ev.target.closest("button[data-eki], button[data-copy], button[data-start], " +
                                "button[data-finish], button[data-cancel], " +
                                "button[data-pt-start], button[data-pt-finish], " +
                                "button[data-tab], button[data-rec-go], " +
@@ -3610,6 +3950,8 @@ document.addEventListener("click", (ev) => {
     }
   } else if (btn.hasAttribute("data-eki")) {
     toggleEki(Number(btn.dataset.eki)).catch(fail);
+  } else if (btn.hasAttribute("data-copy")) {
+    copyLine();
   } else if (btn.hasAttribute("data-start") || btn.hasAttribute("data-finish")) {
     const ref = btn.dataset.start || btn.dataset.finish;
     const pair = popupNode && (popupNode[4] || []).find(x => x[0] === ref);
@@ -3900,7 +4242,12 @@ def main():
 
     p = sub.add_parser("serve", help="地図から履歴を編集できる状態で開く（引数なしと同じ）")
     p.add_argument("--port", type=int, default=SERVE_PORT, help=f"既定 {SERVE_PORT}")
+    p.add_argument("--no-sync", action="store_true",
+                   help=f"{RECORDS_DIR_NAME}/ の記録を GitHub と同期しない")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("sync", help=f"記録を GitHub と同期する（{RECORDS_DIR_NAME}/ が git のとき）")
+    p.set_defaults(func=cmd_sync)
 
     # 普段は serve しか使わないので、引数なしで起動したら serve として扱う。
     # ダブルクリックやショートカットからそのまま開けるようにするため。
