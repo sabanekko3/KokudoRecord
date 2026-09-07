@@ -2259,7 +2259,8 @@ def compose_config():
     branch = (os.environ.get("KOKUDO_RECORDS_BRANCH", "").strip()
               or _git_in_records("symbolic-ref", "--short", "HEAD") or "main")
     base = f"https://github.com/{repo}/edit/{branch}/"
-    return {"repo": repo, "routes": base + "routes.csv", "eki": base + "michinoeki.csv"}
+    return {"repo": repo, "branch": branch,
+            "routes": base + "routes.csv", "eki": base + "michinoeki.csv"}
 
 
 def render_html(data, editable=False, compose=None):
@@ -3105,6 +3106,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                      border-radius: 5px; background: #fff; color: var(--ink); }
   #edit .hint { display: block; color: #6c7a89; margin-top: 4px; }
   a.btn { text-decoration: none; display: inline-block; }
+  #direct[hidden] { display: none !important; }
+  .view .direct { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .view .direct > span:first-child { flex: none; width: 44px; }
+  .view .direct .btn { margin: 0; }
   /* 指で押す端末ではボタンを大きく */
   @media (pointer: coarse) { .btn { font-size: 13px; padding: 7px 12px; } }
   .btn { font: inherit; font-size: 11px; padding: 3px 9px; margin: 2px 3px 0 0;
@@ -3189,6 +3194,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <label class="check">
         <input type="checkbox" id="showEki"><span>道の駅を出す</span>
       </label>
+    </div>
+    <div class="view" id="direct" hidden>
+      <div class="direct">
+        <span>直接記録</span>
+        <span id="directState"></span>
+        <button class="btn" id="directBtn" type="button"></button>
+      </div>
     </div>
     <div id="edit"></div>
     <div class="tabs" id="tabs" hidden>
@@ -3776,9 +3788,34 @@ function showEdit(html) {
 // ---- スマホ用の入力（build した地図のとき） ----
 // 静的な地図には保存先が無い。代わりに routes.csv / michinoeki.csv に足す
 // 1行を組み立てて見せ、GitHub の編集画面に貼ってもらう。
-// Commit すると記録リポジトリの Actions が地図を作り直す。
+// token を保存した端末では、GitHub の Contents API で直接書く（下の「直接記録」）。
+// どちらでも Commit されれば記録リポジトリの Actions が地図を作り直す。
 function csvCell(v) {
   return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+
+// CSV の1行を欄に分ける（引用符付きの欄に対応）
+function csvSplit(line) {
+  const out = [];
+  let cur = "", quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quoted) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else quoted = false;
+      } else cur += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") { out.push(cur); cur = ""; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+// Python 側の eki_name() と同じ正規化（「道の駅　あおき」→「あおき」）
+function ekiName(name) {
+  const n = String(name).normalize("NFKC").replace(/[ 　]/g, "");
+  return n.startsWith("道の駅") ? n.slice(3) : n;
 }
 
 function composeBox(title, line, url, hint) {
@@ -3792,23 +3829,45 @@ function composeBox(title, line, url, hint) {
 
 function composeSection(ref, a, b, section) {
   const line = [ref, section, today(), ""].map(csvCell).join(",");
-  composeBox(`国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b>`, line, CONFIG.compose.routes,
-    "routes.csv の末尾にこの行を貼り付けて「Commit changes」を押してください。" +
-    "1〜2分で地図が更新されます。");
+  const title = `国道${ref}号 <b>${esc(a.label)}〜${esc(b.label)}</b>`;
+  if (DIRECT()) {
+    directBox(title, line,
+      () => editFile("routes.csv", t => appendLine(t, line), `国道${ref}号 ${section} を追加`));
+  } else {
+    composeBox(title, line, CONFIG.compose.routes,
+      "routes.csv の末尾にこの行を貼り付けて「Commit changes」を押してください。" +
+      "1〜2分で地図が更新されます。" + TOKEN_HINT);
+  }
   map.closePopup();
 }
 
 function composeEki(i) {
-  const e = EKI[i];
-  if (e[4]) {
-    composeBox(`道の駅 <b>${esc(e[2])}</b> の訪問を取り消す`, `${e[3]},${e[2]},,`, CONFIG.compose.eki,
+  const e = EKI[i], been = e[4], date = been ? "" : today();
+  const title = `道の駅 <b>${esc(e[2])}</b>` + (been ? " の訪問を取り消す" : " に行った");
+  if (DIRECT()) {
+    directBox(title, null,
+      () => editFile("michinoeki.csv", t => setEkiDate(t, e[3], e[2], date),
+                     `道の駅 ${e[2]} ` + (date ? `訪問 ${date}` : "の訪問を取り消し")),
+      () => {                       // 書けたら手元の印もすぐ変える
+        e[4] = been ? 0 : 1;
+        e[5] = date;
+        const marker = ekiMarkers[i];
+        if (marker) {
+          marker.setStyle({ fillColor: e[4] ? COLORS.done : COLORS.todo,
+                            fillOpacity: e[4] ? 1 : 0.85, radius: e[4] ? 8 : 7 });
+          marker.setPopupContent(ekiPopup(i));
+        }
+        refreshStats({ ekiDone: STATS.ekiDone + (e[4] ? 1 : -1) });
+      });
+  } else if (been) {
+    composeBox(title, `${e[3]},${e[2]},,`, CONFIG.compose.eki,
       `michinoeki.csv で「${esc(e[3])},${esc(e[2])}」の行（複数あれば一番下）の訪問日を消して` +
-      "「Commit changes」を押してください。");
+      "「Commit changes」を押してください。" + TOKEN_HINT);
   } else {
-    const line = [e[3], e[2], today(), ""].map(csvCell).join(",");
-    composeBox(`道の駅 <b>${esc(e[2])}</b> に行った`, line, CONFIG.compose.eki,
+    const line = [e[3], e[2], date, ""].map(csvCell).join(",");
+    composeBox(title, line, CONFIG.compose.eki,
       "michinoeki.csv の末尾にこの行を貼り付けて「Commit changes」を押してください。" +
-      "同じ駅の行が2つになっても、あとの行（訪問日のある方）が使われます。");
+      "同じ駅の行が2つになっても、あとの行（訪問日のある方）が使われます。" + TOKEN_HINT);
   }
   map.closePopup();
 }
@@ -3825,6 +3884,194 @@ async function copyLine() {
   }
   const btn = editEl.querySelector("button[data-copy]");
   if (btn) btn.textContent = "コピーしました";
+}
+
+// ---- GitHub に直接書く（token を保存した端末だけ） ----
+// 公開ページからでも、記録リポジトリだけに書ける fine-grained token があれば
+// Contents API で CSV を書き換えられる。token はこのブラウザの localStorage にだけ置く。
+// github.io は同じユーザーの他のページと origin を共有するので、権限は記録リポジトリに絞ること。
+const TOKEN_KEY = "kokudoRecordsToken";
+const TOKEN_HINT = "<br>「直接記録」に token を設定すると、この画面から GitHub に書き込めます。";
+function loadToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (err) { return ""; }
+}
+function saveToken(t) {
+  try {
+    if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY);
+  } catch (err) { /* 保存できない環境では、この読み込みの間だけ効く */ }
+}
+let TOKEN = COMPOSE ? loadToken() : "";
+function DIRECT() { return COMPOSE && !!TOKEN; }
+
+function ghUrl(file) {
+  return `https://api.github.com/repos/${CONFIG.compose.repo}/contents/${file}`;
+}
+
+async function gh(method, url, body) {
+  const headers = { "Authorization": `Bearer ${TOKEN}`, "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28" };
+  if (body) headers["Content-Type"] = "application/json";
+  const res = await fetch(url, { method: method, headers: headers,
+                                 body: body ? JSON.stringify(body) : undefined });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const why = res.status === 401 ? "token が無効です（期限切れか、貼り間違い）"
+      : res.status === 404 ? "記録リポジトリを読めません（token の Repository access を確認してください）"
+      : res.status === 403 ? "書き込みが拒否されました（token の Contents が Read and write か確認してください）"
+      : res.status === 409 ? "同時に書き換えられました"
+      : (out.message || `GitHub が ${res.status} を返しました`);
+    const err = new Error(why);
+    err.status = res.status;
+    throw err;
+  }
+  return out;
+}
+
+// GitHub の content は base64。UTF-8 と BOM を崩さずに往復させる
+function b64decode(b64) {
+  const bin = atob(b64.replace(/\s/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);   // BOM を残す
+}
+function b64encode(text) {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 8192) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
+  return btoa(bin);
+}
+
+async function readFile(file) {
+  const out = await gh("GET", ghUrl(file) + "?ref=" + encodeURIComponent(CONFIG.compose.branch));
+  return { sha: out.sha, text: b64decode(out.content || "") };
+}
+
+// 読んで → 変えて → 書く。間に誰かが書いていたら（409）一度だけやり直す
+async function editFile(file, change, message) {
+  for (let attempt = 0; ; attempt++) {
+    const cur = await readFile(file);
+    const next = change(cur.text);
+    if (next === cur.text) return false;
+    try {
+      await gh("PUT", ghUrl(file), { message: message, content: b64encode(next),
+                                     sha: cur.sha, branch: CONFIG.compose.branch });
+      return true;
+    } catch (err) {
+      if (err.status !== 409 || attempt > 0) throw err;
+    }
+  }
+}
+
+function appendLine(text, line) {
+  if (text && !text.endsWith("\n")) text += "\n";
+  return text + line + "\n";
+}
+
+// michinoeki.csv のその駅の行の訪問日を書き換える。無ければ足す
+function setEkiDate(text, pref, name, date) {
+  const lines = text.split("\n");
+  let found = false;
+  for (let i = 1; i < lines.length; i++) {
+    const raw = lines[i].replace(/\r$/, "");
+    if (!raw.trim()) continue;
+    const cells = csvSplit(raw);
+    if ((cells[0] || "").trim() !== pref || ekiName(cells[1] || "") !== ekiName(name)) continue;
+    while (cells.length < 4) cells.push("");
+    cells[2] = date;
+    lines[i] = cells.map(csvCell).join(",");
+    found = true;
+  }
+  let out = lines.join("\n");
+  if (!found) out = appendLine(out, [pref, name, date, ""].map(csvCell).join(","));
+  return out;
+}
+
+let directAction = null;      // 「記録する」で実行するもの
+let directAfter = null;       // 書けたあとに手元でやること
+function directBox(title, line, action, after) {
+  directAction = action;
+  directAfter = after || null;
+  showEdit(`${title}<br>` +
+    (line ? `<input class="line" id="composeLine" readonly value="${esc(line)}">` : "") +
+    `<div><button class="btn go" data-direct="1">記録する</button>` +
+    (line ? `<button class="btn" data-copy="1">この行をコピー</button>` : "") +
+    `<button class="btn" data-cancel="1">閉じる</button></div>` +
+    `<span class="hint">GitHub の ${esc(CONFIG.compose.repo)} に直接書き込みます。</span>`);
+}
+
+async function runDirect() {
+  const action = directAction, after = directAfter;
+  if (!action) return;
+  const btn = editEl.querySelector("button[data-direct]");
+  if (btn) { btn.disabled = true; btn.textContent = "送っています…"; }
+  try {
+    const changed = await action();
+    directAction = null;
+    if (after) after();
+    showEdit(`<b>記録しました。</b>` +
+      (changed
+        ? `1〜2分で地図が作り直されます（<a href="https://github.com/${esc(CONFIG.compose.repo)}/actions" ` +
+          `target="_blank" rel="noopener">進み具合</a>）。反映後はページを読み込み直してください。`
+        : "内容は変わっていませんでした。") +
+      `<br><button class="btn" data-cancel="1">閉じる</button>`);
+  } catch (err) {
+    if (btn) { btn.disabled = false; btn.textContent = "記録する"; }
+    const hint = editEl.querySelector(".hint");
+    if (hint) hint.innerHTML = `<b>書き込めませんでした:</b> ${esc(err.message)}`;
+  }
+}
+
+// token の設定（パネルの「直接記録」の行）
+const directEl = document.getElementById("direct");
+const directStateEl = document.getElementById("directState");
+const directBtn = document.getElementById("directBtn");
+function renderDirect() {
+  if (!COMPOSE) return;
+  directEl.hidden = false;
+  directStateEl.textContent = TOKEN ? "有効（この端末から GitHub に書きます）"
+                                    : "未設定（行をコピーして貼る方式）";
+  directBtn.textContent = TOKEN ? "解除" : "token を設定";
+}
+directBtn.addEventListener("click", () => {
+  if (TOKEN) {
+    TOKEN = "";
+    saveToken("");
+    renderDirect();
+    showEdit("");
+    return;
+  }
+  showEdit(`<b>直接記録の設定</b><br>` +
+    `記録リポジトリ（${esc(CONFIG.compose.repo)}）だけに書ける fine-grained token を貼ってください。` +
+    `<input class="line" id="tokenInput" placeholder="github_pat_…" autocomplete="off" spellcheck="false">` +
+    `<div><button class="btn go" data-token-save="1">確認して保存</button>` +
+    `<button class="btn" data-cancel="1">閉じる</button></div>` +
+    `<span class="hint">GitHub の Settings → Developer settings → Personal access tokens → ` +
+    `Fine-grained tokens で作ります。Repository access は ${esc(CONFIG.compose.repo)} だけ、` +
+    `Permissions は Contents を Read and write。token はこのブラウザにだけ保存されます。</span>`);
+});
+
+async function saveTokenFromInput() {
+  const input = document.getElementById("tokenInput");
+  const t = ((input && input.value) || "").trim();
+  if (!t) return;
+  const btn = editEl.querySelector("button[data-token-save]");
+  if (btn) { btn.disabled = true; btn.textContent = "確認しています…"; }
+  TOKEN = t;
+  try {
+    await readFile("routes.csv");        // 読めれば repo も token も合っている
+  } catch (err) {
+    TOKEN = "";
+    if (btn) { btn.disabled = false; btn.textContent = "確認して保存"; }
+    const hint = editEl.querySelector(".hint");
+    if (hint) hint.innerHTML = `<b>確認できませんでした:</b> ${esc(err.message)}`;
+    return;
+  }
+  saveToken(t);
+  renderDirect();
+  showEdit(`直接記録を有効にしました。地点を選んで「記録する」を押すと GitHub に書き込まれます。` +
+    `<br><button class="btn" data-cancel="1">閉じる</button>`);
 }
 
 function refreshStats(stats) {
@@ -3926,7 +4173,8 @@ function applyRouteUpdate(ref, out) {
 
 // 地図・ポップアップ・帯のボタンをまとめて受ける
 document.addEventListener("click", (ev) => {
-  const btn = ev.target.closest("button[data-eki], button[data-copy], button[data-start], " +
+  const btn = ev.target.closest("button[data-eki], button[data-copy], button[data-direct], " +
+                               "button[data-token-save], button[data-start], " +
                                "button[data-finish], button[data-cancel], " +
                                "button[data-pt-start], button[data-pt-finish], " +
                                "button[data-tab], button[data-rec-go], " +
@@ -3952,6 +4200,10 @@ document.addEventListener("click", (ev) => {
     toggleEki(Number(btn.dataset.eki)).catch(fail);
   } else if (btn.hasAttribute("data-copy")) {
     copyLine();
+  } else if (btn.hasAttribute("data-direct")) {
+    runDirect();
+  } else if (btn.hasAttribute("data-token-save")) {
+    saveTokenFromInput();
   } else if (btn.hasAttribute("data-start") || btn.hasAttribute("data-finish")) {
     const ref = btn.dataset.start || btn.dataset.finish;
     const pair = popupNode && (popupNode[4] || []).find(x => x[0] === ref);
@@ -4198,6 +4450,7 @@ if (EDITABLE) {
 }
 
 tabsEl.hidden = !EDITABLE;
+renderDirect();
 setBasemap(basemapEl.value);
 stackLayers();
 drawLabels();
